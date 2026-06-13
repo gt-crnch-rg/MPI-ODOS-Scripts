@@ -1,0 +1,8 @@
+# Keep the build context small — the repos are cloned fresh inside the image.
+.git
+.gitmodules
+apps/omb-odos
+apps/miniweather
+repos
+build
+pkg

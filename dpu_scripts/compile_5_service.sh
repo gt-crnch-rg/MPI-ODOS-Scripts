@@ -3,7 +3,7 @@
 # arg 1 : path to service
 # arg 2 : path to doca
 # arg 3 : path to mpi
-# arg 3 : cmake
+# arg 4 : cmake
 
 ROOT=`pwd`
 SERVICEDIR=$1
