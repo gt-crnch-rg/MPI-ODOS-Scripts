@@ -1,6 +1,6 @@
 [submodule "apps/omb-odos"]
 	path = apps/omb-odos
-	url = https://gitlab.bsc.es/musman/omb-odos.git
+	url = https://github.com/usman0xff/omb-odos.git
 [submodule "apps/miniweather"]
 	path = apps/miniweather
-	url = https://gitlab.bsc.es/musman/miniweather.git
+	url = https://github.com/usman0xff/miniweather.git
