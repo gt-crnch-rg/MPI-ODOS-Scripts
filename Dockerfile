@@ -17,11 +17,15 @@
 #   * doca-omp-service                       (hard-codes the `armclang` aarch64 compiler)
 #   * the SLURM run stage                    (sbatch / squeue / scancel)
 #
-# DOCA: this image ASSUMES NVIDIA DOCA 3.3 is present at ${DOCA_PATH}
-#       (default /opt/mellanox/doca). DOCA is *not* installed here — provide it
-#       via a DOCA base image, a bind mount, or a COPY before the compile steps.
+# DOCA: this image pulls NVIDIA DOCA from an external build context named
+#       `doca` into ${DOCA_PATH} (default /opt/mellanox/doca).
 #
-# Build:   docker build -t odos-mpi .
+#       Example (host has DOCA at /opt/mellanox/doca):
+#         export HOST_DOCA_PATH=/opt/mellanox/doca
+#         docker buildx build --build-context doca="${HOST_DOCA_PATH}" \
+#             -t odos-mpi .
+#
+# Build:   docker buildx build --build-context doca=/opt/mellanox/doca -t odos-mpi .
 # (compile_2_odos.sh builds LLVM/clang: allow plenty of RAM/CPU/time.)
 
 FROM ubuntu:22.04
@@ -66,7 +70,12 @@ RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/module \
     && chmod +x /usr/local/bin/module
 
 # ---------------------------------------------------------------------------
-# 2) Path aliases so hard-coded cluster paths resolve in this container:
+# 2) Import DOCA from external build context (`doca`) into ${DOCA_PATH}
+# ---------------------------------------------------------------------------
+COPY --from=doca . ${DOCA_PATH}/
+
+# ---------------------------------------------------------------------------
+# 3) Path aliases so hard-coded cluster paths resolve in this container:
 #       <rocky DOCA path>  -> ${DOCA_PATH}
 #       ${DOCA_PATH}/lib64 -> DOCA 3.3 Ubuntu lib dir
 #       <rocky cmake path> -> system cmake
@@ -80,15 +89,21 @@ RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/module \
 RUN mkdir -p "$(dirname "$ROCKY_DOCA")" "$(dirname "$ROCKY_CMAKE")" \
     && ln -sfn "$DOCA_PATH" "$ROCKY_DOCA" \
     && ln -sf "$(command -v cmake)" "$ROCKY_CMAKE" \
+    && test -d "$DOCA_PATH" \
     && if [ -d "$DOCA_PATH/lib/x86_64-linux-gnu" ] && [ ! -e "$DOCA_PATH/lib64" ]; then \
            ln -sfn lib/x86_64-linux-gnu "$DOCA_PATH/lib64"; \
        fi
 
 # ---------------------------------------------------------------------------
-# 3) Project scripts
+# 4) Project scripts
 # ---------------------------------------------------------------------------
 WORKDIR ${APP_ROOT}
 COPY . ${APP_ROOT}/
+
+# ---------------------------------------------------------------------------
+# 5) install_odos_prereqs.sh — repo-provided prerequisites
+# ---------------------------------------------------------------------------
+RUN bash install_odos_prereqs.sh
 
 # Make freshly built Open MPI / ODOS-clang visible to later compile steps
 # (compile_4_pnetcdf.sh needs mpicc; non-existent paths on PATH are harmless).
@@ -97,17 +112,17 @@ ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/
 ENV OPAL_PREFIX=${APP_ROOT}/build/ompi/x86_64/install
 
 # ---------------------------------------------------------------------------
-# 4) setup.sh: clone_repos.sh (git clone) + setup_dirs.sh (build/ layout)
+# 6) setup.sh: clone_repos.sh (git clone) + setup_dirs.sh (build/ layout)
 # ---------------------------------------------------------------------------
 RUN sh setup.sh
 
 # ---------------------------------------------------------------------------
-# 5) compile_1_ucx.sh — UCX transport layer (x86_64)
+# 7) compile_1_ucx.sh — UCX transport layer (x86_64)
 # ---------------------------------------------------------------------------
 RUN sh compile_1_ucx.sh ./build/ucx/x86_64
 
 # ---------------------------------------------------------------------------
-# 6) compile_2_odos.sh — ODOS LLVM/clang + OpenMP offload runtime
+# 8) compile_2_odos.sh — ODOS LLVM/clang + OpenMP offload runtime
 # ---------------------------------------------------------------------------
 RUN sh compile_2_odos.sh \
         "$(pwd)/repos/ODOS" \
@@ -115,7 +130,7 @@ RUN sh compile_2_odos.sh \
         "$(pwd)/build/odos/install"
 
 # ---------------------------------------------------------------------------
-# 7) compile_3_ompi.sh — Open MPI (x86_64) + DOCA MCA plugins
+# 9) compile_3_ompi.sh — Open MPI (x86_64) + DOCA MCA plugins
 # ---------------------------------------------------------------------------
 RUN sh compile_3_ompi.sh \
         ./build/ompi/x86_64 \
@@ -124,7 +139,7 @@ RUN sh compile_3_ompi.sh \
         "$ROCKY_CMAKE"
 
 # ---------------------------------------------------------------------------
-# 8) compile_4_pnetcdf.sh — Parallel NetCDF
+# 10) compile_4_pnetcdf.sh — Parallel NetCDF
 # ---------------------------------------------------------------------------
 RUN sh compile_4_pnetcdf.sh ./build/pnetcdf
 

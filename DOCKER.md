@@ -36,9 +36,8 @@ path is `/opt/mellanox/doca`; override with `--build-arg DOCA_PATH=<path>`.
 **Option A — DOCA already installed on the Docker host at the default path:**
 
 ```bash
-docker build \
-  --build-arg DOCA_PATH=/opt/mellanox/doca \
-  -t odos-mpi .
+export HOST_DOCA_PATH=/opt/mellanox/doca
+docker buildx build --build-context doca="${HOST_DOCA_PATH}" -t odos-mpi .
 ```
 
 **Option B — DOCA at a non-standard path:**
@@ -100,6 +99,15 @@ docker cp odos-mpi-tmp:/opt/odos-mpi/build ./build
 
 # Clean up
 docker rm odos-mpi-tmp
+```
+
+## Sharing a Docker image via DockerHub
+
+To share this image via a DockerHub repository, you can do the following steps:
+```
+docker login ## enter your DockerHub username
+docker tag odos-mpi <username>/odos-smartnic:odos-mpi-host-v1
+docker push <username>/odos-smartnic:odos-mpi-host-v1
 ```
 
 ## Known limitations

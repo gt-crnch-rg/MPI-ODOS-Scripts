@@ -2,9 +2,6 @@
 #
 # Installs required build/toolchain packages on Ubuntu, choosing the
 # correct package set based on host architecture (x86_64 or aarch64).
-# This script also installs Docker for the Docker build pathway
-
-set -euo pipefail
 
 #Check for x86 or aarch64 architecture 
 ARCH="$(uname -m)"
@@ -39,11 +36,21 @@ case "$ARCH" in
     exit 1
     ;;
 esac
+
+# Require elevated privileges: run as root or via sudo.
+if [ "${EUID:-$(id -u)}" -eq 0 ]; then
+  SUDO=""
+elif command -v sudo >/dev/null 2>&1; then
+  SUDO="sudo"
+else
+  echo "This script must be run as root or with sudo privileges." >&2
+  exit 1
+fi
  
 echo "Updating package lists..."
-sudo apt update
+${SUDO} apt update
  
 echo "Installing packages: ${PKGS[*]}"
-sudo apt install -y "${PKGS[@]}"
+${SUDO} apt install -y "${PKGS[@]}"
  
 echo "Done."
