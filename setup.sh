@@ -1,4 +1,4 @@
 #!/bin/sh
 
-. clone_repos.sh
-. setup_dirs.sh
+./clone_repos.sh
+./setup_dirs.sh
