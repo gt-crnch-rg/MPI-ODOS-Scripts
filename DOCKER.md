@@ -56,6 +56,11 @@ docker build \
 docker build --no-cache-filter "7" -t odos-mpi .
 ```
 
+You can also use the two-stage build to create a smaller compressed image once the build is complete.
+```bash
+docker buildx build -f Dockerfile.two-stage --build-context doca="${HOST_DOCA_PATH}" -t odos-mpi:two-stage .
+```
+
 > **Note on build time:** `compile_2_odos.sh` builds LLVM/clang from source.
 > Expect 30–90+ minutes depending on CPU count. Subsequent rebuilds reuse the
 > cached layer unless the ODOS source or script changes.
