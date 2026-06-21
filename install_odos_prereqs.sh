@@ -28,7 +28,6 @@ PKGS=(
   libunwind-14
   libunwind-14-dev
   clang-14
-  docker.io
 )
  
 case "$ARCH" in
