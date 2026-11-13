@@ -4,10 +4,11 @@
 #   * builder stage compiles UCX/ODOS/Open MPI/PnetCDF
 #   * runtime stage carries only install artifacts and runtime libs
 #
-# DOCA is provided from an external build context named doca.
-# Example:
-#   export HOST_DOCA_PATH=/opt/mellanox/doca
-#   docker buildx build --build-context doca="${HOST_DOCA_PATH}" -t odos-mpi .
+# Neither stage contains the NVIDIA DOCA SDK: the build bind-mounts it
+# read-only from an external build context named `doca`, and at runtime the
+# host's copy must be mounted at ${DOCA_PATH} (see Dockerfile / DOCKER.md).
+#   docker buildx build -f Dockerfile.two-stage --build-context doca=/opt/mellanox/doca -t odos-mpi:two-stage .
+#   docker run -it -v /opt/mellanox/doca:/opt/mellanox/doca:ro odos-mpi:two-stage
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG DOCA_PATH=/opt/mellanox/doca
@@ -46,18 +47,23 @@ RUN wget -qO- https://apt.kitware.com/keys/kitware-archive-latest.asc \
 RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/module \
     && chmod +x /usr/local/bin/module
 
-COPY --from=doca . ${DOCA_PATH}/
-
 # ---------------------------------------------------------------------------
-# DOCA's rdma-core. DOCA >= 3.x libraries need newer libibverbs/libmlx5
-#     symbol versions (e.g. MLX5_1.25) than Ubuntu 22.04's rdma-core 39, so
-#     install the rdma-core that ships with the imported DOCA release, from
+# DOCA's rdma-core. The DOCA SDK itself is never copied into the image:
+#     RUN steps that need it bind-mount the `doca` build context at ${DOCA_PATH}.
+#     DOCA >= 3.x libraries need newer libibverbs/libmlx5 symbol versions
+#     (e.g. MLX5_1.25) than Ubuntu 22.04's rdma-core 39, so install the
+#     rdma-core that ships with that DOCA release (open source), from
 #     NVIDIA's DOCA apt repo. DOCA_REPO_VERSION defaults to <major>.<minor>.0
 #     of ${DOCA_PATH}/VERSION (e.g. 3.5.0098 -> 3.5.0). Newer repos ship a binary
 #     doca_keyring.gpg, older ones (3.3.0) an ASCII GPG-KEY-Mellanox.pub.
+#     The DOCA version built against is recorded in /etc/odos-doca-version.
 # ---------------------------------------------------------------------------
 ARG DOCA_REPO_VERSION=
-RUN V="${DOCA_REPO_VERSION:-$(cut -d. -f1,2 "$DOCA_PATH/VERSION").0}" \
+RUN --mount=type=bind,from=doca,target=${DOCA_PATH} \
+    test -f "$DOCA_PATH/VERSION" \
+        || { echo "no DOCA SDK in the 'doca' build context: pass --build-context doca=<DOCA install dir>" >&2; exit 1; } \
+    && cp "$DOCA_PATH/VERSION" /etc/odos-doca-version \
+    && V="${DOCA_REPO_VERSION:-$(cut -d. -f1,2 "$DOCA_PATH/VERSION").0}" \
     && R="https://linux.mellanox.com/public/repo/doca/$V/ubuntu22.04/x86_64" \
     && { wget -qO /tmp/doca-key "$R/doca_keyring.gpg" && mv /tmp/doca-key /usr/share/keyrings/doca.gpg; } \
        || { wget -qO- "$R/GPG-KEY-Mellanox.pub" | gpg --batch --yes --dearmor -o /usr/share/keyrings/doca.gpg; } \
@@ -70,11 +76,7 @@ RUN V="${DOCA_REPO_VERSION:-$(cut -d. -f1,2 "$DOCA_PATH/VERSION").0}" \
 
 RUN mkdir -p "$(dirname "$ROCKY_DOCA")" "$(dirname "$ROCKY_CMAKE")" \
     && ln -sfn "$DOCA_PATH" "$ROCKY_DOCA" \
-    && ln -sf "$(command -v cmake)" "$ROCKY_CMAKE" \
-    && test -d "$DOCA_PATH" \
-    && if [ -d "$DOCA_PATH/lib/x86_64-linux-gnu" ] && [ ! -e "$DOCA_PATH/lib64" ]; then \
-           ln -sfn lib/x86_64-linux-gnu "$DOCA_PATH/lib64"; \
-       fi
+    && ln -sf "$(command -v cmake)" "$ROCKY_CMAKE"
 
 WORKDIR ${APP_ROOT}
 COPY . ${APP_ROOT}/
@@ -82,16 +84,18 @@ COPY . ${APP_ROOT}/
 RUN bash install_odos_prereqs.sh
 
 ENV PATH=${APP_ROOT}/build/ompi/x86_64/install/bin:${APP_ROOT}/build/odos/install/bin:${APP_ROOT}/build/ucx/x86_64/install/bin:${PATH}
-ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${APP_ROOT}/build/pnetcdf/install/lib:${DOCA_PATH}/lib64
+ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${APP_ROOT}/build/pnetcdf/install/lib:${DOCA_PATH}/lib/x86_64-linux-gnu
 ENV OPAL_PREFIX=${APP_ROOT}/build/ompi/x86_64/install
 
 RUN sh setup.sh
 RUN sh compile_1_ucx.sh ./build/ucx/x86_64
-RUN sh compile_2_odos.sh \
+RUN --mount=type=bind,from=doca,target=${DOCA_PATH} \
+    sh compile_2_odos.sh \
         "$(pwd)/repos/ODOS" \
         "$(pwd)/build/odos/build" \
         "$(pwd)/build/odos/install"
-RUN sh compile_3_ompi.sh \
+RUN --mount=type=bind,from=doca,target=${DOCA_PATH} \
+    sh compile_3_ompi.sh \
         ./build/ompi/x86_64 \
         "$(pwd)/build/ucx/x86_64/install" \
         "$ROCKY_DOCA" \
@@ -102,7 +106,8 @@ RUN sh compile_4_pnetcdf.sh ./build/pnetcdf
 # image whose install trees are empty. REQUIRE_DOCA=1 (the default) also
 # requires the ODOS/DOCA components; pass REQUIRE_DOCA=0 to accept stock-only.
 ARG REQUIRE_DOCA=1
-RUN REQUIRE_DOCA=${REQUIRE_DOCA} sh verify_build.sh ./build
+RUN --mount=type=bind,from=doca,target=${DOCA_PATH} \
+    REQUIRE_DOCA=${REQUIRE_DOCA} sh verify_build.sh ./build
 
 FROM ubuntu:22.04
 
@@ -128,20 +133,17 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/module \
     && chmod +x /usr/local/bin/module
 
-COPY --from=builder ${DOCA_PATH}/ ${DOCA_PATH}/
-
 # DOCA's rdma-core, from the repo the builder stage set up (see there).
+COPY --from=builder /etc/odos-doca-version /etc/odos-doca-version
 COPY --from=builder /usr/share/keyrings/doca.gpg /usr/share/keyrings/doca.gpg
 COPY --from=builder /etc/apt/sources.list.d/doca.list /etc/apt/sources.list.d/doca.list
 RUN apt-get update && apt-get install -y --no-install-recommends \
         libibverbs1 ibverbs-providers librdmacm1 rdma-core \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p "$(dirname "$ROCKY_DOCA")" "$(dirname "$ROCKY_CMAKE")" \
-    && ln -sfn "$DOCA_PATH" "$ROCKY_DOCA" \
-    && if [ -d "$DOCA_PATH/lib/x86_64-linux-gnu" ] && [ ! -e "$DOCA_PATH/lib64" ]; then \
-           ln -sfn lib/x86_64-linux-gnu "$DOCA_PATH/lib64"; \
-       fi
+# The ODOS MPI plugins find DOCA through this alias (their RUNPATH).
+RUN mkdir -p "$(dirname "$ROCKY_DOCA")" \
+    && ln -sfn "$DOCA_PATH" "$ROCKY_DOCA"
 
 WORKDIR ${APP_ROOT}
 COPY . ${APP_ROOT}/
@@ -153,12 +155,13 @@ COPY --from=builder ${APP_ROOT}/build/ompi/x86_64/install ${APP_ROOT}/build/ompi
 COPY --from=builder ${APP_ROOT}/build/pnetcdf/install ${APP_ROOT}/build/pnetcdf/install
 
 ENV PATH=${APP_ROOT}/build/ompi/x86_64/install/bin:${APP_ROOT}/build/odos/install/bin:${APP_ROOT}/build/ucx/x86_64/install/bin:${PATH}
-ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${APP_ROOT}/build/pnetcdf/install/lib:${DOCA_PATH}/lib64
+ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${APP_ROOT}/build/pnetcdf/install/lib:${DOCA_PATH}/lib/x86_64-linux-gnu
 ENV OPAL_PREFIX=${APP_ROOT}/build/ompi/x86_64/install
 
 # Re-verify in the runtime stage: catches artifacts that were built but not
 # carried over by the COPY --from=builder lines above.
 ARG REQUIRE_DOCA=1
-RUN REQUIRE_DOCA=${REQUIRE_DOCA} sh verify_build.sh ./build
+RUN --mount=type=bind,from=doca,target=${DOCA_PATH} \
+    REQUIRE_DOCA=${REQUIRE_DOCA} sh verify_build.sh ./build
 
 CMD ["/bin/bash"]

@@ -7,6 +7,8 @@ inside a Docker container using the provided `Dockerfile`.
 
 - Docker Engine 20.10+ (BuildKit enabled by default)
 - NVIDIA DOCA 3.3 or later installed on the host at `/opt/mellanox/doca`
+  (the SDK: `doca-sdk-*` and `libdoca-sdk-*-dev` packages). It is needed both
+  to build the image and to run it — the image does not contain DOCA.
 - Network access to `linux.mellanox.com` (DOCA's rdma-core, see below)
 - ~50 GB free disk space (LLVM/clang build is large)
 - 16+ GB RAM recommended for the LLVM compile step
@@ -32,8 +34,12 @@ for the x86_64 host, running each compile script as a separate Docker layer:
 
 ## Build
 
-DOCA must be present inside the build context or bind-mounted. The default
-path is `/opt/mellanox/doca`; override with `--build-arg DOCA_PATH=<path>`.
+The images do **not** contain the NVIDIA DOCA SDK. The build bind-mounts the
+host's DOCA install read-only, from a build context named `doca`, only for the
+steps that compile or check against it; nothing from it is written into a
+layer. At runtime the host's DOCA is mounted into the container the same way
+(see [Run](#run)). Inside the image DOCA always lives at `/opt/mellanox/doca`
+(`--build-arg DOCA_PATH=<path>` changes that, rarely needed).
 
 The image also installs the rdma-core user-space libraries that ship with
 that DOCA release, from NVIDIA's DOCA apt repo: DOCA 3.x needs newer
@@ -42,19 +48,18 @@ without them none of DOCA's libraries load. The repo version is derived from
 `<doca>/VERSION` (e.g. `3.5.0098` → `3.5.0`); override it with
 `--build-arg DOCA_REPO_VERSION=<x.y.z>`.
 
-**Option A — DOCA already installed on the Docker host at the default path:**
+**Option A — DOCA installed on the Docker host at the default path:**
 
 ```bash
 export HOST_DOCA_PATH=/opt/mellanox/doca
 docker buildx build --build-context doca="${HOST_DOCA_PATH}" -t odos-mpi .
 ```
 
-**Option B — DOCA at a non-standard path:**
+**Option B — DOCA installed somewhere else on the host:** point the build
+context at it; inside the image it is still `/opt/mellanox/doca`.
 
 ```bash
-docker build \
-  --build-arg DOCA_PATH=/path/to/doca \
-  -t odos-mpi .
+docker buildx build --build-context doca=/path/to/doca -t odos-mpi .
 ```
 
 **Option C — Rebuild from a specific layer without rerunning earlier steps**
@@ -105,13 +110,29 @@ any ODOS/DOCA component (OpenMP runtime, BlueField offload plugin, ODOS pml/osc
 plugins) is missing. To accept a stock-only build, pass
 `--build-arg REQUIRE_DOCA=0`; the ODOS/DOCA components then only warn.
 
-## Inspect the build
+## Run
 
-Drop into a shell inside the finished image:
+Mount the host's DOCA install read-only at `/opt/mellanox/doca`:
 
 ```bash
-docker run --rm -it odos-mpi
+docker run --rm -it -v /opt/mellanox/doca:/opt/mellanox/doca:ro odos-mpi
 ```
+
+- Use the **same DOCA release** on the host as the image was built against;
+  the image's rdma-core is matched to it. The build version is recorded in
+  `/etc/odos-doca-version`, and `verify_build.sh` warns on a mismatch.
+- Without the mount, everything except the ODOS/DOCA components still works
+  (UCX, Open MPI, ODOS clang, PnetCDF); `verify_build.sh` says DOCA is missing.
+- Talking to the DPU over Comch also needs the RDMA devices in the container,
+  typically `--device=/dev/infiniband` (or `--privileged`).
+
+Check the install from inside the container:
+
+```bash
+cd /opt/odos-mpi && REQUIRE_DOCA=1 sh verify_build.sh ./build
+```
+
+## Inspect the build
 
 Installed components are under `/opt/odos-mpi/build/`:
 
@@ -147,6 +168,13 @@ docker rm odos-mpi-tmp
 ```
 
 ## Sharing a Docker image via DockerHub
+
+The images contain no DOCA SDK, so they can be shared without redistributing
+it. (They do contain rdma-core from NVIDIA's DOCA apt repo, which is open
+source, and that repo's apt configuration.) Whoever runs the image needs DOCA
+installed on their host — the same release the image was built against — and
+mounts it as shown under [Run](#run); say which release in the tag or
+description.
 
 To share this image via a DockerHub repository, you can do the following steps:
 ```

@@ -17,15 +17,14 @@
 #   * doca-omp-service                       (hard-codes the `armclang` aarch64 compiler)
 #   * the SLURM run stage                    (sbatch / squeue / scancel)
 #
-# DOCA: this image pulls NVIDIA DOCA from an external build context named
-#       `doca` into ${DOCA_PATH} (default /opt/mellanox/doca).
-#
-#       Example (host has DOCA at /opt/mellanox/doca):
-#         export HOST_DOCA_PATH=/opt/mellanox/doca
-#         docker buildx build --build-context doca="${HOST_DOCA_PATH}" \
-#             -t odos-mpi .
+# DOCA: the image does NOT contain the NVIDIA DOCA SDK. The build bind-mounts
+#       it read-only from an external build context named `doca` for the steps
+#       that compile or check against it; at runtime, mount the host's copy at
+#       ${DOCA_PATH} (default /opt/mellanox/doca). Use the same DOCA release on
+#       the host as at build time -- the image's rdma-core is matched to it.
 #
 # Build:   docker buildx build --build-context doca=/opt/mellanox/doca -t odos-mpi .
+# Run:     docker run -it -v /opt/mellanox/doca:/opt/mellanox/doca:ro odos-mpi
 # (compile_2_odos.sh builds LLVM/clang: allow plenty of RAM/CPU/time.)
 
 FROM ubuntu:22.04
@@ -71,20 +70,22 @@ RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/module \
     && chmod +x /usr/local/bin/module
 
 # ---------------------------------------------------------------------------
-# 2) Import DOCA from external build context (`doca`) into ${DOCA_PATH}
-# ---------------------------------------------------------------------------
-COPY --from=doca . ${DOCA_PATH}/
-
-# ---------------------------------------------------------------------------
-# 2b) DOCA's rdma-core. DOCA >= 3.x libraries need newer libibverbs/libmlx5
-#     symbol versions (e.g. MLX5_1.25) than Ubuntu 22.04's rdma-core 39, so
-#     install the rdma-core that ships with the imported DOCA release, from
+# 2) DOCA's rdma-core. The DOCA SDK itself is never copied into the image:
+#     RUN steps that need it bind-mount the `doca` build context at ${DOCA_PATH}.
+#     DOCA >= 3.x libraries need newer libibverbs/libmlx5 symbol versions
+#     (e.g. MLX5_1.25) than Ubuntu 22.04's rdma-core 39, so install the
+#     rdma-core that ships with that DOCA release (open source), from
 #     NVIDIA's DOCA apt repo. DOCA_REPO_VERSION defaults to <major>.<minor>.0
 #     of ${DOCA_PATH}/VERSION (e.g. 3.5.0098 -> 3.5.0). Newer repos ship a binary
 #     doca_keyring.gpg, older ones (3.3.0) an ASCII GPG-KEY-Mellanox.pub.
+#     The DOCA version built against is recorded in /etc/odos-doca-version.
 # ---------------------------------------------------------------------------
 ARG DOCA_REPO_VERSION=
-RUN V="${DOCA_REPO_VERSION:-$(cut -d. -f1,2 "$DOCA_PATH/VERSION").0}" \
+RUN --mount=type=bind,from=doca,target=${DOCA_PATH} \
+    test -f "$DOCA_PATH/VERSION" \
+        || { echo "no DOCA SDK in the 'doca' build context: pass --build-context doca=<DOCA install dir>" >&2; exit 1; } \
+    && cp "$DOCA_PATH/VERSION" /etc/odos-doca-version \
+    && V="${DOCA_REPO_VERSION:-$(cut -d. -f1,2 "$DOCA_PATH/VERSION").0}" \
     && R="https://linux.mellanox.com/public/repo/doca/$V/ubuntu22.04/x86_64" \
     && { wget -qO /tmp/doca-key "$R/doca_keyring.gpg" && mv /tmp/doca-key /usr/share/keyrings/doca.gpg; } \
        || { wget -qO- "$R/GPG-KEY-Mellanox.pub" | gpg --batch --yes --dearmor -o /usr/share/keyrings/doca.gpg; } \
@@ -98,20 +99,15 @@ RUN V="${DOCA_REPO_VERSION:-$(cut -d. -f1,2 "$DOCA_PATH/VERSION").0}" \
 # ---------------------------------------------------------------------------
 # 3) Path aliases so hard-coded cluster paths resolve in this container:
 #       <rocky DOCA path>  -> ${DOCA_PATH}
-#       ${DOCA_PATH}/lib64 -> DOCA >= 3.x Ubuntu lib dir
 #       <rocky cmake path> -> system cmake
 #
-#    DOCA >= 3.x installs its libraries under lib/x86_64-linux-gnu; the lib64
-#    alias keeps the cluster-era paths working. The DOCA 2.0 Comm Channel ->
+#    The DOCA alias dangles until the SDK is mounted at ${DOCA_PATH} (during
+#    the build, and from the host at runtime). The DOCA 2.0 Comm Channel ->
 #    Comch source port is in patches/, applied by setup.sh (apply_patches.sh).
 # ---------------------------------------------------------------------------
 RUN mkdir -p "$(dirname "$ROCKY_DOCA")" "$(dirname "$ROCKY_CMAKE")" \
     && ln -sfn "$DOCA_PATH" "$ROCKY_DOCA" \
-    && ln -sf "$(command -v cmake)" "$ROCKY_CMAKE" \
-    && test -d "$DOCA_PATH" \
-    && if [ -d "$DOCA_PATH/lib/x86_64-linux-gnu" ] && [ ! -e "$DOCA_PATH/lib64" ]; then \
-           ln -sfn lib/x86_64-linux-gnu "$DOCA_PATH/lib64"; \
-       fi
+    && ln -sf "$(command -v cmake)" "$ROCKY_CMAKE"
 
 # ---------------------------------------------------------------------------
 # 4) Project scripts
@@ -127,7 +123,7 @@ RUN bash install_odos_prereqs.sh
 # Make freshly built Open MPI / ODOS-clang visible to later compile steps
 # (compile_4_pnetcdf.sh needs mpicc; non-existent paths on PATH are harmless).
 ENV PATH=${APP_ROOT}/build/ompi/x86_64/install/bin:${APP_ROOT}/build/odos/install/bin:${APP_ROOT}/build/ucx/x86_64/install/bin:${PATH}
-ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${APP_ROOT}/build/pnetcdf/install/lib:${DOCA_PATH}/lib64
+ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${APP_ROOT}/build/pnetcdf/install/lib:${DOCA_PATH}/lib/x86_64-linux-gnu
 ENV OPAL_PREFIX=${APP_ROOT}/build/ompi/x86_64/install
 
 # ---------------------------------------------------------------------------
@@ -143,7 +139,8 @@ RUN sh compile_1_ucx.sh ./build/ucx/x86_64
 # ---------------------------------------------------------------------------
 # 8) compile_2_odos.sh — ODOS LLVM/clang + OpenMP offload runtime
 # ---------------------------------------------------------------------------
-RUN sh compile_2_odos.sh \
+RUN --mount=type=bind,from=doca,target=${DOCA_PATH} \
+    sh compile_2_odos.sh \
         "$(pwd)/repos/ODOS" \
         "$(pwd)/build/odos/build" \
         "$(pwd)/build/odos/install"
@@ -151,7 +148,8 @@ RUN sh compile_2_odos.sh \
 # ---------------------------------------------------------------------------
 # 9) compile_3_ompi.sh — Open MPI (x86_64) + DOCA MCA plugins
 # ---------------------------------------------------------------------------
-RUN sh compile_3_ompi.sh \
+RUN --mount=type=bind,from=doca,target=${DOCA_PATH} \
+    sh compile_3_ompi.sh \
         ./build/ompi/x86_64 \
         "$(pwd)/build/ucx/x86_64/install" \
         "$ROCKY_DOCA" \
@@ -169,7 +167,8 @@ RUN sh compile_4_pnetcdf.sh ./build/pnetcdf
 #     pass --build-arg REQUIRE_DOCA=0 to accept a stock-only build.
 # ---------------------------------------------------------------------------
 ARG REQUIRE_DOCA=1
-RUN REQUIRE_DOCA=${REQUIRE_DOCA} sh verify_build.sh ./build
+RUN --mount=type=bind,from=doca,target=${DOCA_PATH} \
+    REQUIRE_DOCA=${REQUIRE_DOCA} sh verify_build.sh ./build
 
 # Applications (apps/) and the SLURM run stage are left to the user;
 # see apps/README.md.

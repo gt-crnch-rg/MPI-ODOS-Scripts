@@ -62,6 +62,17 @@ check() {
 
 echo "Verifying build artifacts under $BUILD"
 echo
+
+# The Docker images do not contain DOCA; it is mounted from the host.
+if ! ls "$DOCA_PATH"/lib/*/libdoca_common.so* >/dev/null 2>&1; then
+    echo "NOTE: no DOCA SDK at $DOCA_PATH, so the ODOS/DOCA components cannot load."
+    echo "      In the Docker image, mount the host's: docker run -v $DOCA_PATH:$DOCA_PATH:ro ..."
+    echo
+elif [ -f /etc/odos-doca-version ] && [ -f "$DOCA_PATH/VERSION" ] \
+     && [ "`cat /etc/odos-doca-version`" != "`cat "$DOCA_PATH/VERSION"`" ]; then
+    echo "WARNING: built against DOCA `cat /etc/odos-doca-version`, but $DOCA_PATH is DOCA `cat "$DOCA_PATH/VERSION"`."
+    echo
+fi
 echo "Core components:"
 check required "UCX libucp"          "$BUILD/ucx/x86_64/install/lib/libucp.so"
 check required "UCX ucx_info"        "$BUILD/ucx/x86_64/install/bin/ucx_info"
