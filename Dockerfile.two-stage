@@ -48,6 +48,26 @@ RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/module \
 
 COPY --from=doca . ${DOCA_PATH}/
 
+# ---------------------------------------------------------------------------
+# DOCA's rdma-core. DOCA >= 3.x libraries need newer libibverbs/libmlx5
+#     symbol versions (e.g. MLX5_1.25) than Ubuntu 22.04's rdma-core 39, so
+#     install the rdma-core that ships with the imported DOCA release, from
+#     NVIDIA's DOCA apt repo. DOCA_REPO_VERSION defaults to <major>.<minor>.0
+#     of ${DOCA_PATH}/VERSION (e.g. 3.5.0098 -> 3.5.0). Newer repos ship a binary
+#     doca_keyring.gpg, older ones (3.3.0) an ASCII GPG-KEY-Mellanox.pub.
+# ---------------------------------------------------------------------------
+ARG DOCA_REPO_VERSION=
+RUN V="${DOCA_REPO_VERSION:-$(cut -d. -f1,2 "$DOCA_PATH/VERSION").0}" \
+    && R="https://linux.mellanox.com/public/repo/doca/$V/ubuntu22.04/x86_64" \
+    && { wget -qO /tmp/doca-key "$R/doca_keyring.gpg" && mv /tmp/doca-key /usr/share/keyrings/doca.gpg; } \
+       || { wget -qO- "$R/GPG-KEY-Mellanox.pub" | gpg --batch --yes --dearmor -o /usr/share/keyrings/doca.gpg; } \
+    && echo "deb [signed-by=/usr/share/keyrings/doca.gpg] $R/ ./" > /etc/apt/sources.list.d/doca.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        libibverbs1 ibverbs-providers librdmacm1 rdma-core libibverbs-dev librdmacm-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && ! LD_LIBRARY_PATH="$DOCA_PATH/lib/x86_64-linux-gnu" \
+         ldd "$DOCA_PATH/lib/x86_64-linux-gnu/libdoca_comch.so" 2>&1 | grep "not found"
+
 RUN mkdir -p "$(dirname "$ROCKY_DOCA")" "$(dirname "$ROCKY_CMAKE")" \
     && ln -sfn "$DOCA_PATH" "$ROCKY_DOCA" \
     && ln -sf "$(command -v cmake)" "$ROCKY_CMAKE" \
@@ -61,8 +81,8 @@ COPY . ${APP_ROOT}/
 
 RUN bash install_odos_prereqs.sh
 
-ENV PATH=${APP_ROOT}/build/ompi/x86_64/install/bin:${APP_ROOT}/build/odos/install/bin:${PATH}
-ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${DOCA_PATH}/lib64:${LD_LIBRARY_PATH}
+ENV PATH=${APP_ROOT}/build/ompi/x86_64/install/bin:${APP_ROOT}/build/odos/install/bin:${APP_ROOT}/build/ucx/x86_64/install/bin:${PATH}
+ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${APP_ROOT}/build/pnetcdf/install/lib:${DOCA_PATH}/lib64
 ENV OPAL_PREFIX=${APP_ROOT}/build/ompi/x86_64/install
 
 RUN sh setup.sh
@@ -78,6 +98,12 @@ RUN sh compile_3_ompi.sh \
         "$ROCKY_CMAKE"
 RUN sh compile_4_pnetcdf.sh ./build/pnetcdf
 
+# The compile scripts have no `set -e`; fail here rather than shipping an
+# image whose install trees are empty. REQUIRE_DOCA=1 (the default) also
+# requires the ODOS/DOCA components; pass REQUIRE_DOCA=0 to accept stock-only.
+ARG REQUIRE_DOCA=1
+RUN REQUIRE_DOCA=${REQUIRE_DOCA} sh verify_build.sh ./build
+
 FROM ubuntu:22.04
 
 ARG DEBIAN_FRONTEND
@@ -88,9 +114,13 @@ ARG ROCKY_CMAKE
 ENV APP_ROOT=/opt/odos-mpi
 ENV DOCA_PATH=${DOCA_PATH}
 
-# Runtime dependencies only.
+# Runtime dependencies only. binutils/libgomp1/libxml2 are not optional:
+# every UCX library links libbfd-2.38-system.so, ucx_perftest links
+# libgomp.so.1, and the LLVM tools link libxml2.so.2. openssh-client is
+# needed by mpirun's default rsh launcher.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        bash ca-certificates \
+        bash ca-certificates openssh-client \
+        binutils libgomp1 libxml2 \
         libnuma1 libffi8 libelf1 \
         libibverbs1 librdmacm1 rdma-core \
     && rm -rf /var/lib/apt/lists/*
@@ -99,6 +129,13 @@ RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/module \
     && chmod +x /usr/local/bin/module
 
 COPY --from=builder ${DOCA_PATH}/ ${DOCA_PATH}/
+
+# DOCA's rdma-core, from the repo the builder stage set up (see there).
+COPY --from=builder /usr/share/keyrings/doca.gpg /usr/share/keyrings/doca.gpg
+COPY --from=builder /etc/apt/sources.list.d/doca.list /etc/apt/sources.list.d/doca.list
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        libibverbs1 ibverbs-providers librdmacm1 rdma-core \
+    && rm -rf /var/lib/apt/lists/*
 
 RUN mkdir -p "$(dirname "$ROCKY_DOCA")" "$(dirname "$ROCKY_CMAKE")" \
     && ln -sfn "$DOCA_PATH" "$ROCKY_DOCA" \
@@ -115,8 +152,13 @@ COPY --from=builder ${APP_ROOT}/build/odos/install ${APP_ROOT}/build/odos/instal
 COPY --from=builder ${APP_ROOT}/build/ompi/x86_64/install ${APP_ROOT}/build/ompi/x86_64/install
 COPY --from=builder ${APP_ROOT}/build/pnetcdf/install ${APP_ROOT}/build/pnetcdf/install
 
-ENV PATH=${APP_ROOT}/build/ompi/x86_64/install/bin:${APP_ROOT}/build/odos/install/bin:${PATH}
-ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${APP_ROOT}/build/pnetcdf/install/lib:${DOCA_PATH}/lib64:${LD_LIBRARY_PATH}
+ENV PATH=${APP_ROOT}/build/ompi/x86_64/install/bin:${APP_ROOT}/build/odos/install/bin:${APP_ROOT}/build/ucx/x86_64/install/bin:${PATH}
+ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${APP_ROOT}/build/pnetcdf/install/lib:${DOCA_PATH}/lib64
 ENV OPAL_PREFIX=${APP_ROOT}/build/ompi/x86_64/install
+
+# Re-verify in the runtime stage: catches artifacts that were built but not
+# carried over by the COPY --from=builder lines above.
+ARG REQUIRE_DOCA=1
+RUN REQUIRE_DOCA=${REQUIRE_DOCA} sh verify_build.sh ./build
 
 CMD ["/bin/bash"]

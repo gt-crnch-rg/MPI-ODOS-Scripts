@@ -6,7 +6,8 @@ inside a Docker container using the provided `Dockerfile`.
 ## Prerequisites
 
 - Docker Engine 20.10+ (BuildKit enabled by default)
-- NVIDIA DOCA 3.3 installed on the host at `/opt/mellanox/doca`
+- NVIDIA DOCA 3.3 or later installed on the host at `/opt/mellanox/doca`
+- Network access to `linux.mellanox.com` (DOCA's rdma-core, see below)
 - ~50 GB free disk space (LLVM/clang build is large)
 - 16+ GB RAM recommended for the LLVM compile step
 
@@ -17,11 +18,12 @@ for the x86_64 host, running each compile script as a separate Docker layer:
 
 | Layer | Script | What it builds |
 |-------|--------|----------------|
-| 4 | `setup.sh` | Clone repos, lay out `build/` tree |
+| 4 | `setup.sh` | Clone repos (pinned commits), apply `patches/`, lay out `build/` tree |
 | 5 | `compile_1_ucx.sh` | UCX transport library (x86_64) |
 | 6 | `compile_2_odos.sh` | ODOS LLVM/clang + OpenMP offload runtime |
 | 7 | `compile_3_ompi.sh` | Open MPI + DOCA MCA plugins (x86_64) |
 | 8 | `compile_4_pnetcdf.sh` | Parallel NetCDF |
+| 9 | `verify_build.sh` | Asserts the artifacts above actually exist |
 
 **Out of scope** (requires an aarch64/BlueField host):
 - `dpu_scripts/compile_dpu.sh` — aarch64 UCX + Open MPI
@@ -32,6 +34,13 @@ for the x86_64 host, running each compile script as a separate Docker layer:
 
 DOCA must be present inside the build context or bind-mounted. The default
 path is `/opt/mellanox/doca`; override with `--build-arg DOCA_PATH=<path>`.
+
+The image also installs the rdma-core user-space libraries that ship with
+that DOCA release, from NVIDIA's DOCA apt repo: DOCA 3.x needs newer
+`libibverbs`/`libmlx5` symbol versions than Ubuntu 22.04's rdma-core, and
+without them none of DOCA's libraries load. The repo version is derived from
+`<doca>/VERSION` (e.g. `3.5.0098` → `3.5.0`); override it with
+`--build-arg DOCA_REPO_VERSION=<x.y.z>`.
 
 **Option A — DOCA already installed on the Docker host at the default path:**
 
@@ -56,14 +65,45 @@ docker build \
 docker build --no-cache-filter "7" -t odos-mpi .
 ```
 
-You can also use the two-stage build to create a smaller compressed image once the build is complete.
+**Option D — two-stage build for a smaller distributable image:**
+
 ```bash
 docker buildx build -f Dockerfile.two-stage --build-context doca="${HOST_DOCA_PATH}" -t odos-mpi:two-stage .
 ```
 
+This drops the source and build trees and keeps only the install trees, taking
+the image from ~16 GB to ~4.6 GB.
+
+It is **not** a drop-in replacement for the single-stage image: the runtime
+stage carries no compilers or `make`/`cmake`, so `mpicc` and `clang` cannot
+link anything inside it. Use it to ship or run prebuilt binaries; use the
+single-stage image to build applications. Note also that its builder stage does
+not reliably reuse the single-stage image's layers, so expect a full LLVM
+rebuild when switching.
+
 > **Note on build time:** `compile_2_odos.sh` builds LLVM/clang from source.
 > Expect 30–90+ minutes depending on CPU count. Subsequent rebuilds reuse the
 > cached layer unless the ODOS source or script changes.
+
+## Verify the build
+
+The `compile_*.sh` scripts do not use `set -e`, so a failed configure or make
+still exits 0 and the Docker layer still caches as successful. The build
+therefore ends with an explicit check:
+
+```bash
+sh verify_build.sh ./build
+```
+
+A component counts as present only if its file exists **and** `ldd` resolves
+all of its shared libraries, including symbol versions — so a DOCA-linked
+plugin sitting on a too-old rdma-core is reported as `BROKEN`, not `ok`.
+
+The Dockerfiles run it with `REQUIRE_DOCA=1`, so the build fails if any core
+component (UCX, ODOS clang, Open MPI with a ucx pml/osc component, PnetCDF) *or*
+any ODOS/DOCA component (OpenMP runtime, BlueField offload plugin, ODOS pml/osc
+plugins) is missing. To accept a stock-only build, pass
+`--build-arg REQUIRE_DOCA=0`; the ODOS/DOCA components then only warn.
 
 ## Inspect the build
 
@@ -117,24 +157,70 @@ docker push <username>/odos-smartnic:odos-mpi-host-v1
 
 ## Known limitations
 
-### DOCA 3.3 API changes
+### DOCA 3.x port (`patches/`)
 
-The scripts were written against DOCA 2.0.2 (Rocky Linux). DOCA 3.3 renamed
-`libdoca_comm_channel` → `libdoca_comch` and changed the library path from
-`lib64/` to `lib/x86_64-linux-gnu/`. This affects:
+The ODOS sources were written against DOCA 2.0.2, whose Comm Channel API
+(`doca_comm_channel.h`) DOCA 3.x removed in favour of Comch (`doca_comch.h`).
+`setup.sh` therefore runs `apply_patches.sh` after cloning, which ports all
+three DOCA users:
 
-- **`compile_3_ompi.sh`** — Open MPI DOCA MCA plugins link against
-  `libdoca_comm_channel.so`, `libdoca_dma.so`, `libdoca_common.so`
-- **`compile_2_odos.sh`** — ODOS OpenMP offload runtime uses DOCA Comm Channel
+| Repo | Patched | Runs on |
+|------|---------|---------|
+| ODOS | `openmp/libomptarget/plugins/bf` (BlueField offload plugin) | host |
+| ompi-bf | `ompi/mca/{pml,osc}/ucx/*_doca.c` (ODOS MCA plugins) | host and DPU |
+| doca-omp-service | `ref/`, `mpi/` | DPU |
 
-`compile_1_ucx.sh` and `compile_4_pnetcdf.sh` are unaffected.
+The send/receive path goes through one shared header, `patches/odos_comch.h`,
+which rebuilds the old blocking one-message semantics on top of Comch's
+asynchronous tasks and receive callbacks, so the ODOS wire protocol (2 KB
+messages, an ack every 64 KB) is unchanged. Host and DPU must both run the
+ported code: a DOCA 2.0 build on one side cannot talk to a Comch build on the
+other.
 
-If the DOCA-linked steps fail, the build log will show the linker error. The
-scripts use `set -x` but not `set -e`, so the build continues past failures —
-check which install directories were actually populated.
+The patches target the commits `clone_repos.sh` now pins. Patch-specific
+behaviour, configurable through the environment:
 
-### Private app submodules
+- `ODOS_COMCH_REP_PCI` (DPU) — PCI address of the representor the server
+  listens on. Default: the first network representor that is not an uplink
+  (DOCA 2.0 code used `rep[0]`, which in DOCA 3.x is the uplink).
+- `ODOS_COMCH_CONNECT_TIMEOUT` (host) — seconds to keep retrying the
+  connection to the DPU service; `-1` retries forever. The offload plugin
+  defaults to 30 s, the MPI plugins retry forever (as before).
 
-`apps/omb-odos` and `apps/miniweather` are private GitLab submodules with no
-public mirror. The application compile stage (`apps/compile.sh`) is therefore
-not included in this Dockerfile. Refer to `apps/README.md` for those steps.
+What has been verified, and what has not:
+
+- All five components build and link against DOCA 3.3.0109 and 3.5.0098,
+  with no unresolved symbols (`ldd -r`).
+- `patches/test/test_odos_comch.c` runs the ODOS protocol through
+  `odos_comch.h` against a mock of the Comch API (asynchronous sends, few
+  send slots, reconnects), under ASan/UBSan.
+- **Not yet run on hardware.** A real host ↔ DPU round trip still needs to be
+  tested on a BlueField.
+- The DPU-side scripts (`dpu_scripts/compile_dpu.sh`,
+  `compile_5_service.sh`) still point at the cluster's DOCA 2.0.2 module
+  paths, and `dpu_scripts/Dockerfile` does not yet install DOCA's arm64
+  rdma-core; both need updating for a DOCA 3.x DPU build.
+
+`compile_3_ompi.sh` builds each ODOS plugin *before* renaming the stock
+component to `orig.mca_*_ucx.so`, so a failed plugin build leaves working stock
+UCX components in place. It also gives the plugin `cmake` invocation:
+
+- the in-tree libevent/hwloc include paths, which the plugin `CMakeLists.txt`
+  assumes are already on the include path (true on the cluster via hpcx, not
+  on a plain distro);
+- Open MPI's own machine flags (`-m*`, i.e. `-mcx16` on x86_64). The plugins
+  compile Open MPI's 128-bit atomics; without `-mcx16` gcc emits a
+  `__sync_val_compare_and_swap_16` call that no library provides, which only
+  fails once that code path runs.
+
+### App submodules and the `pkg/` tree
+
+`apps/omb-odos` and `apps/miniweather` are git submodules (public, on GitHub —
+see `.gitmodules`) and are excluded from the build context by `.dockerignore`,
+so the application compile stage is not part of this Dockerfile.
+
+`apps/compile.sh` also reads from a `pkg/` tree produced by `prepare_pkg.sh`,
+which the image does not create: `prepare_pkg.sh` requires the aarch64 UCX and
+Open MPI builds and the DPU service, all out of scope for an x86_64 host image.
+Building the applications therefore needs either a DPU-side build as well, or a
+host-only variant of `prepare_pkg.sh`. Refer to `apps/README.md`.

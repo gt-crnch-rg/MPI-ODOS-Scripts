@@ -1,0 +1,871 @@
+Port doca-omp-service (ref and mpi) from the DOCA 2.0 Comm Channel API to
+DOCA >= 3.0 Comch (Comm Channel was removed in DOCA 3.x).
+
+* send/recv go through odos_comch.h (copied in by apply_patches.sh)
+* a host that disconnects ends the session; main() then re-initialises and
+  waits for the next host (it used to spin in recvfrom forever)
+* DPU representor: odos_comch_open_rep() (rep[0] is now the uplink); the
+  representor is closed on teardown
+* CMake: minimum 3.10 (CMake 4 rejects 3.0); armclang stays the default but
+  -DCMAKE_C_COMPILER now overrides it; link libdoca_comch
+
+Against usman0xff/doca-omp-service 655b3b555abc7800d336f6eb9f4aaf5335552eaf.
+
+diff --git a/mpi/CMakeLists.txt b/mpi/CMakeLists.txt
+index 18f95d4..5214d2d 100644
+--- a/mpi/CMakeLists.txt
++++ b/mpi/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required(VERSION 3.0.0)
++cmake_minimum_required(VERSION 3.10)
+ 
+ EXECUTE_PROCESS( COMMAND uname -m COMMAND tr -d '\n' OUTPUT_VARIABLE ARCH )
+ message( STATUS "Architecture: ${ARCH}" )
+@@ -15,12 +15,28 @@ message( STATUS "DOCA: ${DOCA_PATH}" )
+ 
+ project(docaservice)
+ 
+-set(CMAKE_C_COMPILER "armclang")
++if(NOT CMAKE_C_COMPILER)
++	set(CMAKE_C_COMPILER "armclang")
++endif()
+ set(CMAKE_C_FLAGS "-O1 -ldl -fopenmp")
+ 
+ set(CMAKE_SKIP_RPATH TRUE)
+ add_definitions(-w)
+ 
++# DOCA >= 3.x: Comch replaces Comm Channel, and the libraries moved from
++# lib64/ to lib/<arch>-linux-gnu/.
++set(additional_libs "")
++foreach(_doca_lib doca_common doca_comch)
++	find_library(${_doca_lib}_LIBRARY ${_doca_lib}
++		HINTS "${DOCA_PATH}/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu" "${DOCA_PATH}/lib64"
++		NO_DEFAULT_PATH)
++	if(NOT ${_doca_lib}_LIBRARY)
++		message(FATAL_ERROR "${_doca_lib} not found under ${DOCA_PATH} (DOCA >= 3.0 required)")
++	endif()
++	list(APPEND additional_libs "${${_doca_lib}_LIBRARY}")
++endforeach()
++add_definitions(-DDOCA_ALLOW_EXPERIMENTAL_API)
++
+ add_executable(
+ 	doca-omp-service
+ 	doca-omp-service.c
+@@ -37,8 +53,6 @@ target_link_libraries(
+ 	elf
+ 	ffi
+ 	pthread
+-	${DOCA_PATH}/lib64/libdoca_dma.so
+-	${DOCA_PATH}/lib64/libdoca_common.so
+-	${DOCA_PATH}/lib64/libdoca_comm_channel.so
++	${additional_libs}
+ 	${MPI_PATH}/lib/libmpi.so
+ )
+diff --git a/mpi/doca-omp-service.c b/mpi/doca-omp-service.c
+index b074649..4c96abd 100644
+--- a/mpi/doca-omp-service.c
++++ b/mpi/doca-omp-service.c
+@@ -13,9 +13,10 @@
+ #include <link.h>
+ 
+ #include <doca_dev.h>
+-#include <doca_dma.h>
+ #include <doca_log.h>
+-#include <doca_comm_channel.h>
++
++/* DOCA >= 3.x: Comch replaces the removed Comm Channel API. */
++#include "odos_comch.h"
+ 
+ #define SERVER_NAME "omp_test0"
+ 
+@@ -67,7 +68,7 @@ enum BF_COMMANDS {
+ 
+ struct rep_devinfo {
+ 	char vuid[DOCA_DEVINFO_VUID_SIZE];
+-	struct doca_pci_bdf pci_bdf;
++	char pci_addr[DOCA_DEVINFO_PCI_ADDR_SIZE];
+ 
+ 	struct doca_dev_rep *rep_dev;
+ };
+@@ -91,7 +92,7 @@ struct bf_info {
+ 	unsigned char ipv4_addr[DOCA_DEVINFO_IPV4_ADDR_SIZE];
+ 	unsigned char ipv6_addr[DOCA_DEVINFO_IPV6_ADDR_SIZE];
+ 	
+-	struct doca_pci_bdf pci_bdf;
++	char pci_addr[DOCA_DEVINFO_PCI_ADDR_SIZE];
+ 	
+ 	struct mmap_support mmap_support;
+ 	struct comm_channel cc;
+@@ -105,15 +106,7 @@ struct bf_info {
+ 
+ 
+ struct bf_conn {
+-	struct doca_comm_channel_ep_t   *ep;
+-	struct doca_comm_channel_addr_t *peer;
+-
+-	int epoll_fd;
+-	int  send_fd;
+-	int  recv_fd;
+-
+-	struct epoll_event send_event;
+-	struct epoll_event recv_event;
++	struct odos_comch cc;
+ 
+ 	char sbuf[__MAX_SZ__];
+ 	char rbuf[__MAX_SZ__];
+@@ -154,7 +147,8 @@ int bf_send_buf(struct bf_conn *conn, void *buf, size_t sz)
+ 			len = __MAX_SZ__;
+ 		else
+ 			len = sz - sent_len;
+-		doca_comm_channel_ep_sendto(conn->ep, (char *)buf+sent_len, len, DOCA_CC_MSG_FLAG_NONE, conn->peer);
++		if (odos_comch_send(&conn->cc, (char *)buf+sent_len, len) != DOCA_SUCCESS)
++			return -1;
+ 		if (ack_reset > __ACK_RESET__) {
+ 			bf_recv_buf(conn, conn->rbuf, __MAX_SZ__);
+ 			//printf("ack after %ld bytes.\n", sent_len);
+@@ -175,12 +169,8 @@ int bf_recv_buf(struct bf_conn *conn, void *buf, size_t sz)
+ 			len = __MAX_SZ__;
+ 		else
+ 			len = sz - recvd_len;
+-		while(
+-			doca_comm_channel_ep_recvfrom(
+-				conn->ep, (char *)buf+recvd_len, &len,
+-				DOCA_CC_MSG_FLAG_NONE, &conn->peer)
+-			== DOCA_ERROR_AGAIN
+-		);
++		if (odos_comch_recv(&conn->cc, (char *)buf+recvd_len, &len) != DOCA_SUCCESS)
++			return -1;
+ 		if (ack_reset > __ACK_RESET__) {
+ 			bf_send_buf(conn, conn->sbuf, __MAX_SZ__);
+ 			//printf("ack after %ld bytes.\n", recvd_len);
+@@ -384,7 +374,7 @@ int process_cmd_run_target_region(struct bf_openmp_cmd *cmd)
+ 
+ int process_cmd_set_info_flag(struct bf_openmp_cmd *cmd)
+ {
+-	doca_log_global_level_set(DOCA_LOG_LEVEL_INFO);
++	odos_doca_log_level_set(DOCA_LOG_LEVEL_INFO);
+ 	return 0;
+ }
+ 
+@@ -396,8 +386,7 @@ void bf_print_deviceinfo(int id)
+ 	printf("        iface     :  %s\n", devinfo.iface);
+ 	printf("        ib dev    :  %s\n", devinfo.ibdev);
+ 	printf("        doca id   :  %d\n", devinfo.doca_id);
+-	printf("        pci addr  :  %02X:%02X:%X\n",
+-		devinfo.pci_bdf.bus, devinfo.pci_bdf.device, devinfo.pci_bdf.function);
++	printf("        pci addr  :  %s\n", devinfo.pci_addr);
+ 	printf("        ipv4 addr :  %s\n", devinfo.ipv4_addr);
+ 	printf("        ipv6 addr :  %s\n", devinfo.ipv6_addr);
+ 	printf("        rep list support           :   %s\n",
+@@ -436,7 +425,7 @@ int bf_init_deviceinfo()
+ 	struct doca_devinfo_rep ** rep_dev_list;
+ 
+ 	total_devices = 0;
+-	ret = doca_devinfo_list_create(&doca_dev_list, &tmp_total_devices);
++	ret = doca_devinfo_create_list(&doca_dev_list, &tmp_total_devices);
+ 	if (ret != DOCA_SUCCESS) {
+ 		DOCA_LOG_ERR("devinfo_list_create failed.");
+ 		return OFFLOAD_FAIL;
+@@ -446,13 +435,12 @@ int bf_init_deviceinfo()
+ 	for (i = 0; i < tmp_total_devices; ++i) {
+ 		memset((void*)&devinfo, 0, sizeof(devinfo));
+ 
+-		ret = doca_dma_job_get_supported(doca_dev_list[i], DOCA_DMA_JOB_MEMCPY);
+-		if (ret != DOCA_SUCCESS) {
+-			DOCA_LOG_DBG("dma not supported.");
++		if (!odos_comch_dev_supported(doca_dev_list[i], 1)) {
++			DOCA_LOG_DBG("comch not supported.");
+ 			continue;
+ 		}
+ #if 0
+-		ret = doca_devinfo_rep_get_is_list_all_supported(
++		ret = doca_devinfo_rep_cap_is_filter_all_supported(
+ 			dev_list[i], &devinfo.rep_support);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed.");
+@@ -468,7 +456,7 @@ int bf_init_deviceinfo()
+ 		++total_devices;
+ 
+ 	}
+-	dev_list = (struct bf_dev *)malloc(total_devices * sizeof(struct bf_dev));
++	dev_list = (struct bf_dev *)calloc(total_devices, sizeof(struct bf_dev));
+ 	if (dev_list == NULL) {
+ 		DOCA_LOG_ERR("failed to allocated dev_list");
+ 		return OFFLOAD_FAIL;
+@@ -477,9 +465,8 @@ int bf_init_deviceinfo()
+ 	for (i = 0, k = 0; i < tmp_total_devices; ++i) {
+ 		memset((void*)&devinfo, 0, sizeof(devinfo));
+ 
+-		ret = doca_dma_job_get_supported(doca_dev_list[i], DOCA_DMA_JOB_MEMCPY);
+-		if (ret != DOCA_SUCCESS) {
+-			DOCA_LOG_DBG("dma not supported.");
++		if (!odos_comch_dev_supported(doca_dev_list[i], 1)) {
++			DOCA_LOG_DBG("comch not supported.");
+ 			continue;
+ 		}
+ 
+@@ -497,8 +484,8 @@ int bf_init_deviceinfo()
+ 			DOCA_LOG_ERR("devinfo get failed [ibdev].");
+ 			return OFFLOAD_FAIL;
+ 		}
+-		ret = doca_devinfo_get_pci_addr(
+-			doca_dev_list[i], &devinfo.pci_bdf);
++		ret = doca_devinfo_get_pci_addr_str(
++			doca_dev_list[i], devinfo.pci_addr);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [PCI].");
+ 			return OFFLOAD_FAIL;
+@@ -529,14 +516,14 @@ int bf_init_deviceinfo()
+ 			return OFFLOAD_FAIL;
+ 		}
+ #endif
+-		ret = doca_devinfo_rep_get_is_list_all_supported(
++		ret = doca_devinfo_rep_cap_is_filter_all_supported(
+ 			doca_dev_list[i], &devinfo.rep_support);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [rep support].");
+ 			return OFFLOAD_FAIL;
+ 		}
+ 
+-		ret = doca_comm_channel_get_max_message_size(
++		ret = doca_comch_cap_get_max_msg_size(
+ 			doca_dev_list[i], &devinfo.cc.max_msg_size);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [cc max msg size].");
+@@ -544,20 +531,20 @@ int bf_init_deviceinfo()
+ 		}
+ #if 0
+ 		// fails regularly
+-		ret = doca_comm_channel_get_service_max_num_connections(
++		ret = doca_comch_cap_get_max_clients(
+ 			dev_list[i], &devinfo.cc.max_num_connections);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [cc max conn].");
+ 			return;
+ 		}
+ #endif
+-		ret = doca_comm_channel_get_max_send_queue_size(
++		ret = doca_comch_cap_get_max_send_tasks(
+ 			doca_dev_list[i], &devinfo.cc.max_send_queue_size);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [cc max send queue size].");
+ 			return OFFLOAD_FAIL;
+ 		}
+-		ret = doca_comm_channel_get_max_recv_queue_size(
++		ret = doca_comch_cap_get_max_recv_queue_size(
+ 			doca_dev_list[i], &devinfo.cc.max_recv_queue_size);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [cc max recv queue size].");
+@@ -569,8 +556,8 @@ int bf_init_deviceinfo()
+ 			DOCA_LOG_ERR("dev open failed.");
+ 			return OFFLOAD_FAIL;
+ 		}
+-		ret = doca_devinfo_rep_list_create(
+-			dev, DOCA_DEV_REP_FILTER_NET, &rep_dev_list, &devinfo.total_rep_devices
++		ret = doca_devinfo_rep_create_list(
++			dev, DOCA_DEVINFO_REP_FILTER_NET, &rep_dev_list, &devinfo.total_rep_devices
+ 		);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo_rep_list_create failed.");
+@@ -578,7 +565,7 @@ int bf_init_deviceinfo()
+ 		}
+ 		devinfo.rep = (struct rep_devinfo *)malloc(devinfo.total_rep_devices * sizeof(struct rep_devinfo));
+ 		for (j = 0; j < devinfo.total_rep_devices; ++j) {
+-			ret = doca_devinfo_rep_get_is_list_all_supported(
++			ret = doca_devinfo_rep_cap_is_filter_all_supported(
+ 				doca_dev_list[i], &devinfo.rep_support);
+ 			if (ret != DOCA_SUCCESS) {
+ 				DOCA_LOG_ERR("devinfo failed [rep support]");
+@@ -599,7 +586,7 @@ int bf_init_deviceinfo()
+ 			}
+ #endif
+ 		}
+-		doca_devinfo_rep_list_destroy(rep_dev_list);
++		doca_devinfo_rep_destroy_list(rep_dev_list);
+ 		doca_dev_close(dev);
+ 		dev_list[k].info = devinfo;
+ 		++k;
+@@ -614,7 +601,7 @@ void bf_deinit_deviceinfo()
+ 		free(dev_list[j].info.rep);
+ 	}
+ 	free(dev_list);
+-	doca_devinfo_list_destroy(doca_dev_list);
++	doca_devinfo_destroy_list(doca_dev_list);
+ 
+ }
+ 
+@@ -627,65 +614,27 @@ int bf_init_connection(int id, char type, const char *server_name, struct bf_con
+ 	struct doca_dev      *doca_dev = devinfo.doca_dev;
+ 	struct doca_dev_rep   *rep_dev;
+ 
+-	ret = doca_comm_channel_ep_create(&conn->ep);
+-	if (ret != DOCA_SUCCESS) {
+-		DOCA_LOG_ERR("failed to create ep");
+-		return OFFLOAD_FAIL;
+-	}
+-	DOCA_LOG_DBG("created ep");
+-	ret = doca_comm_channel_ep_set_device(conn->ep, doca_dev);
+-	if (ret != DOCA_SUCCESS) {
+-		DOCA_LOG_ERR("failed to set doca_dev in ep");
+-		return OFFLOAD_FAIL;
+-	}
+-
+ 	if (type == SERVER_MODE) {
+ 		rep_dev = devinfo.rep[0].rep_dev;
+-		doca_comm_channel_ep_set_device_rep(conn->ep, rep_dev);
++		ret = odos_comch_server_start(&conn->cc, doca_dev, rep_dev, server_name);
+ 		if (ret != DOCA_SUCCESS) {
+-			DOCA_LOG_ERR("failed to set rep_dev in ep");
+-			return OFFLOAD_FAIL;
+-		}
+-		printf("[server] server name: %s\n", server_name);
+-		ret = doca_comm_channel_ep_listen(conn->ep, server_name);
+-		if (ret != DOCA_SUCCESS) {
+-			DOCA_LOG_ERR("dpu is NOT listening :(");
++			DOCA_LOG_ERR("dpu is NOT listening :( [%s]", doca_error_get_name((doca_error_t)ret));
+ 			puts("dpu is NOT listening :(");
+-			return DOCA_ERROR_INITIALIZATION;
++			return OFFLOAD_FAIL;
+ 		}
+ 		DOCA_LOG_INFO("dpu is listening...");
+-		//puts("dpu is listening...");
++		printf("[server] listening as %s\n", server_name);
+ 	} else {
+ 		DOCA_LOG_INFO("going to connect....");
+-		ret = doca_comm_channel_ep_connect(conn->ep, server_name, &conn->peer);
++		/* Not used by the service, which only runs as the server. */
++		ret = odos_comch_client_connect(&conn->cc, doca_dev, server_name, 30);
+ 		if (ret != DOCA_SUCCESS) {
+-			DOCA_LOG_ERR("host failed to connect :(");
++			DOCA_LOG_ERR("host failed to connect :( [%s]", doca_error_get_name((doca_error_t)ret));
+ 			return OFFLOAD_FAIL;
+ 		}
+ 		DOCA_LOG_INFO("connected");
+-
+-		while (
+-			doca_comm_channel_peer_addr_update_info(conn->peer) \
+-				== DOCA_ERROR_CONNECTION_INPROGRESS
+-		);
+-		DOCA_LOG_DBG("updated peer addr info");
+-	}
+-
+-
+-	conn->epoll_fd = epoll_create1(0);
+-
+-	doca_comm_channel_ep_get_event_channel(conn->ep, &conn->send_fd, &conn->recv_fd);
+-
+-	conn->recv_event.events  = EPOLLIN;
+-	conn->recv_event.data.fd = conn->recv_fd;
+-
+-	ret = epoll_ctl(conn->epoll_fd, EPOLL_CTL_ADD, conn->recv_fd, &conn->recv_event);
+-	if (ret == -1) {
+-		DOCA_LOG_ERR("epoll failed.");
+-		return OFFLOAD_FAIL;
+ 	}
+ 
+-
+ 	return 0;
+ }
+ 
+@@ -701,7 +650,6 @@ int bf_init_device(int id, char type, const char *server_name)
+ 
+ 	struct doca_dev_rep      **rep_dev;
+ 	struct doca_devinfo_rep ** rep_dev_list;
+-	struct doca_pci_bdf       rep_pci_bdf;
+ 
+ 	dev_list[id].total_libraries = 0;
+ 
+@@ -718,20 +666,12 @@ int bf_init_device(int id, char type, const char *server_name)
+ 	if (type == SERVER_MODE) {
+ 		rep_dev = &devinfo->rep[0].rep_dev;
+ 
+-		ret = doca_devinfo_rep_list_create( \
+-			*doca_dev, DOCA_DEV_REP_FILTER_NET, &rep_dev_list, &total_rep_devices
+-		);
+-		DOCA_LOG_INFO("total rep devices: %d\n", total_rep_devices);
+-
+-		doca_dev_rep_open(rep_dev_list[0], rep_dev);
++		ret = odos_comch_open_rep(*doca_dev, rep_dev);
+ 
+-		if (*rep_dev == NULL) {
++		if (ret != DOCA_SUCCESS || *rep_dev == NULL) {
+ 			DOCA_LOG_ERR("failed to open device.");
+ 			return DOCA_ERROR_INITIALIZATION;
+ 		}
+-		doca_devinfo_rep_get_pci_addr(rep_dev_list[0], &rep_pci_bdf);
+-		DOCA_LOG_DBG("opened rep device: %02X:%02X:%X\n", rep_pci_bdf.bus, rep_pci_bdf.device, rep_pci_bdf.function);
+-		doca_devinfo_rep_list_destroy(rep_dev_list);
+ 	}
+ 
+ 	DOCA_LOG_DBG("opened device");
+@@ -749,7 +689,11 @@ int bf_init_device(int id, char type, const char *server_name)
+ 
+ void bf_deinit_device(int id)
+ {
+-	doca_comm_channel_ep_destroy(dev_list[id].conn.ep);
++	odos_comch_destroy(&dev_list[id].conn.cc);
++	if (dev_list[id].info.rep != NULL && dev_list[id].info.rep[0].rep_dev != NULL) {
++		doca_dev_rep_close(dev_list[id].info.rep[0].rep_dev);
++		dev_list[id].info.rep[0].rep_dev = NULL;
++	}
+ 	doca_dev_close(dev_list[id].info.doca_dev);
+ }
+ 
+@@ -770,7 +714,7 @@ void deinit_server()
+ {
+ 	bf_deinit_device(0);
+ 	bf_deinit_deviceinfo();
+-	doca_log_global_level_set(DOCA_LOG_LEVEL_CRIT);
++	odos_doca_log_level_set(DOCA_LOG_LEVEL_CRIT);
+ 	return;
+ }
+ 
+@@ -782,7 +726,10 @@ int run_service()
+ 	size_t msglen = sizeof(cmd);
+ 
+ 	while (1) {
+-		bf_recv_buf(conn, &cmd, sizeof(cmd));
++		if (bf_recv_buf(conn, &cmd, sizeof(cmd)) != 0) {
++			DOCA_LOG_INFO("host disconnected");
++			break;
++		}
+ 		DOCA_LOG_DBG("cmd: %d\n", cmd.cmd);
+ 		switch(cmd.cmd) {
+ 			case CMD_LOAD_BINARY:
+@@ -823,7 +770,7 @@ deinit:
+ int main(int argc, char *argv[])
+ {
+ 	int ret;
+-	doca_log_global_level_set(DOCA_LOG_LEVEL_CRIT);
++	odos_doca_log_level_set(DOCA_LOG_LEVEL_CRIT);
+ 
+ 	puts("init...");
+ 	MPI_Init(NULL, NULL);
+diff --git a/ref/CMakeLists.txt b/ref/CMakeLists.txt
+index 82f366f..a93d8a6 100644
+--- a/ref/CMakeLists.txt
++++ b/ref/CMakeLists.txt
+@@ -1,4 +1,4 @@
+-cmake_minimum_required(VERSION 3.0.0)
++cmake_minimum_required(VERSION 3.10)
+ 
+ EXECUTE_PROCESS( COMMAND uname -m COMMAND tr -d '\n' OUTPUT_VARIABLE ARCH )
+ message( STATUS "Architecture: ${ARCH}" )
+@@ -13,11 +13,27 @@ message( STATUS "DOCA: ${DOCA_PATH}" )
+ 
+ project(docaservice)
+ 
+-set(CMAKE_C_COMPILER "armclang")
++if(NOT CMAKE_C_COMPILER)
++	set(CMAKE_C_COMPILER "armclang")
++endif()
+ set(CMAKE_C_FLAGS "-O1 -ldl -fopenmp")
+ 
+ add_definitions(-w)
+ 
++# DOCA >= 3.x: Comch replaces Comm Channel, and the libraries moved from
++# lib64/ to lib/<arch>-linux-gnu/.
++set(additional_libs "")
++foreach(_doca_lib doca_common doca_comch)
++	find_library(${_doca_lib}_LIBRARY ${_doca_lib}
++		HINTS "${DOCA_PATH}/lib/${CMAKE_SYSTEM_PROCESSOR}-linux-gnu" "${DOCA_PATH}/lib64"
++		NO_DEFAULT_PATH)
++	if(NOT ${_doca_lib}_LIBRARY)
++		message(FATAL_ERROR "${_doca_lib} not found under ${DOCA_PATH} (DOCA >= 3.0 required)")
++	endif()
++	list(APPEND additional_libs "${${_doca_lib}_LIBRARY}")
++endforeach()
++add_definitions(-DDOCA_ALLOW_EXPERIMENTAL_API)
++
+ add_executable(
+ 	doca-omp-service
+ 	doca-omp-service.c
+@@ -33,7 +49,5 @@ target_link_libraries(
+ 	elf
+ 	ffi
+ 	pthread
+-	${DOCA_PATH}/lib64/libdoca_dma.so
+-	${DOCA_PATH}/lib64/libdoca_common.so
+-	${DOCA_PATH}/lib64/libdoca_comm_channel.so
++	${additional_libs}
+ )
+diff --git a/ref/doca-omp-service.c b/ref/doca-omp-service.c
+index 45e1d80..d6bea0b 100644
+--- a/ref/doca-omp-service.c
++++ b/ref/doca-omp-service.c
+@@ -12,9 +12,10 @@
+ #include <link.h>
+ 
+ #include <doca_dev.h>
+-#include <doca_dma.h>
+ #include <doca_log.h>
+-#include <doca_comm_channel.h>
++
++/* DOCA >= 3.x: Comch replaces the removed Comm Channel API. */
++#include "odos_comch.h"
+ 
+ #define SERVER_NAME "omp_test0"
+ 
+@@ -66,7 +67,7 @@ enum BF_COMMANDS {
+ 
+ struct rep_devinfo {
+ 	char vuid[DOCA_DEVINFO_VUID_SIZE];
+-	struct doca_pci_bdf pci_bdf;
++	char pci_addr[DOCA_DEVINFO_PCI_ADDR_SIZE];
+ 
+ 	struct doca_dev_rep *rep_dev;
+ };
+@@ -90,7 +91,7 @@ struct bf_info {
+ 	unsigned char ipv4_addr[DOCA_DEVINFO_IPV4_ADDR_SIZE];
+ 	unsigned char ipv6_addr[DOCA_DEVINFO_IPV6_ADDR_SIZE];
+ 	
+-	struct doca_pci_bdf pci_bdf;
++	char pci_addr[DOCA_DEVINFO_PCI_ADDR_SIZE];
+ 	
+ 	struct mmap_support mmap_support;
+ 	struct comm_channel cc;
+@@ -104,15 +105,7 @@ struct bf_info {
+ 
+ 
+ struct bf_conn {
+-	struct doca_comm_channel_ep_t   *ep;
+-	struct doca_comm_channel_addr_t *peer;
+-
+-	int epoll_fd;
+-	int  send_fd;
+-	int  recv_fd;
+-
+-	struct epoll_event send_event;
+-	struct epoll_event recv_event;
++	struct odos_comch cc;
+ 
+ 	char sbuf[__MAX_SZ__];
+ 	char rbuf[__MAX_SZ__];
+@@ -153,7 +146,8 @@ int bf_send_buf(struct bf_conn *conn, void *buf, size_t sz)
+ 			len = __MAX_SZ__;
+ 		else
+ 			len = sz - sent_len;
+-		doca_comm_channel_ep_sendto(conn->ep, (char *)buf+sent_len, len, DOCA_CC_MSG_FLAG_NONE, conn->peer);
++		if (odos_comch_send(&conn->cc, (char *)buf+sent_len, len) != DOCA_SUCCESS)
++			return -1;
+ 		if (ack_reset > __ACK_RESET__) {
+ 			bf_recv_buf(conn, conn->rbuf, __MAX_SZ__);
+ 			//printf("ack after %ld bytes.\n", sent_len);
+@@ -174,12 +168,8 @@ int bf_recv_buf(struct bf_conn *conn, void *buf, size_t sz)
+ 			len = __MAX_SZ__;
+ 		else
+ 			len = sz - recvd_len;
+-		while(
+-			doca_comm_channel_ep_recvfrom(
+-				conn->ep, (char *)buf+recvd_len, &len,
+-				DOCA_CC_MSG_FLAG_NONE, &conn->peer)
+-			== DOCA_ERROR_AGAIN
+-		);
++		if (odos_comch_recv(&conn->cc, (char *)buf+recvd_len, &len) != DOCA_SUCCESS)
++			return -1;
+ 		if (ack_reset > __ACK_RESET__) {
+ 			bf_send_buf(conn, conn->sbuf, __MAX_SZ__);
+ 			//printf("ack after %ld bytes.\n", recvd_len);
+@@ -383,7 +373,7 @@ int process_cmd_run_target_region(struct bf_openmp_cmd *cmd)
+ 
+ int process_cmd_set_info_flag(struct bf_openmp_cmd *cmd)
+ {
+-	doca_log_global_level_set(DOCA_LOG_LEVEL_INFO);
++	odos_doca_log_level_set(DOCA_LOG_LEVEL_INFO);
+ 	return 0;
+ }
+ 
+@@ -395,8 +385,7 @@ void bf_print_deviceinfo(int id)
+ 	printf("        iface     :  %s\n", devinfo.iface);
+ 	printf("        ib dev    :  %s\n", devinfo.ibdev);
+ 	printf("        doca id   :  %d\n", devinfo.doca_id);
+-	printf("        pci addr  :  %02X:%02X:%X\n",
+-		devinfo.pci_bdf.bus, devinfo.pci_bdf.device, devinfo.pci_bdf.function);
++	printf("        pci addr  :  %s\n", devinfo.pci_addr);
+ 	printf("        ipv4 addr :  %s\n", devinfo.ipv4_addr);
+ 	printf("        ipv6 addr :  %s\n", devinfo.ipv6_addr);
+ 	printf("        rep list support           :   %s\n",
+@@ -435,7 +424,7 @@ int bf_init_deviceinfo()
+ 	struct doca_devinfo_rep ** rep_dev_list;
+ 
+ 	total_devices = 0;
+-	ret = doca_devinfo_list_create(&doca_dev_list, &tmp_total_devices);
++	ret = doca_devinfo_create_list(&doca_dev_list, &tmp_total_devices);
+ 	if (ret != DOCA_SUCCESS) {
+ 		DOCA_LOG_ERR("devinfo_list_create failed.");
+ 		return OFFLOAD_FAIL;
+@@ -445,13 +434,12 @@ int bf_init_deviceinfo()
+ 	for (i = 0; i < tmp_total_devices; ++i) {
+ 		memset((void*)&devinfo, 0, sizeof(devinfo));
+ 
+-		ret = doca_dma_job_get_supported(doca_dev_list[i], DOCA_DMA_JOB_MEMCPY);
+-		if (ret != DOCA_SUCCESS) {
+-			DOCA_LOG_DBG("dma not supported.");
++		if (!odos_comch_dev_supported(doca_dev_list[i], 1)) {
++			DOCA_LOG_DBG("comch not supported.");
+ 			continue;
+ 		}
+ #if 0
+-		ret = doca_devinfo_rep_get_is_list_all_supported(
++		ret = doca_devinfo_rep_cap_is_filter_all_supported(
+ 			dev_list[i], &devinfo.rep_support);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed.");
+@@ -467,7 +455,7 @@ int bf_init_deviceinfo()
+ 		++total_devices;
+ 
+ 	}
+-	dev_list = (struct bf_dev *)malloc(total_devices * sizeof(struct bf_dev));
++	dev_list = (struct bf_dev *)calloc(total_devices, sizeof(struct bf_dev));
+ 	if (dev_list == NULL) {
+ 		DOCA_LOG_ERR("failed to allocated dev_list");
+ 		return OFFLOAD_FAIL;
+@@ -476,9 +464,8 @@ int bf_init_deviceinfo()
+ 	for (i = 0, k = 0; i < tmp_total_devices; ++i) {
+ 		memset((void*)&devinfo, 0, sizeof(devinfo));
+ 
+-		ret = doca_dma_job_get_supported(doca_dev_list[i], DOCA_DMA_JOB_MEMCPY);
+-		if (ret != DOCA_SUCCESS) {
+-			DOCA_LOG_DBG("dma not supported.");
++		if (!odos_comch_dev_supported(doca_dev_list[i], 1)) {
++			DOCA_LOG_DBG("comch not supported.");
+ 			continue;
+ 		}
+ 
+@@ -496,8 +483,8 @@ int bf_init_deviceinfo()
+ 			DOCA_LOG_ERR("devinfo get failed [ibdev].");
+ 			return OFFLOAD_FAIL;
+ 		}
+-		ret = doca_devinfo_get_pci_addr(
+-			doca_dev_list[i], &devinfo.pci_bdf);
++		ret = doca_devinfo_get_pci_addr_str(
++			doca_dev_list[i], devinfo.pci_addr);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [PCI].");
+ 			return OFFLOAD_FAIL;
+@@ -528,14 +515,14 @@ int bf_init_deviceinfo()
+ 			return OFFLOAD_FAIL;
+ 		}
+ #endif
+-		ret = doca_devinfo_rep_get_is_list_all_supported(
++		ret = doca_devinfo_rep_cap_is_filter_all_supported(
+ 			doca_dev_list[i], &devinfo.rep_support);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [rep support].");
+ 			return OFFLOAD_FAIL;
+ 		}
+ 
+-		ret = doca_comm_channel_get_max_message_size(
++		ret = doca_comch_cap_get_max_msg_size(
+ 			doca_dev_list[i], &devinfo.cc.max_msg_size);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [cc max msg size].");
+@@ -543,20 +530,20 @@ int bf_init_deviceinfo()
+ 		}
+ #if 0
+ 		// fails regularly
+-		ret = doca_comm_channel_get_service_max_num_connections(
++		ret = doca_comch_cap_get_max_clients(
+ 			dev_list[i], &devinfo.cc.max_num_connections);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [cc max conn].");
+ 			return;
+ 		}
+ #endif
+-		ret = doca_comm_channel_get_max_send_queue_size(
++		ret = doca_comch_cap_get_max_send_tasks(
+ 			doca_dev_list[i], &devinfo.cc.max_send_queue_size);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [cc max send queue size].");
+ 			return OFFLOAD_FAIL;
+ 		}
+-		ret = doca_comm_channel_get_max_recv_queue_size(
++		ret = doca_comch_cap_get_max_recv_queue_size(
+ 			doca_dev_list[i], &devinfo.cc.max_recv_queue_size);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo get failed [cc max recv queue size].");
+@@ -568,8 +555,8 @@ int bf_init_deviceinfo()
+ 			DOCA_LOG_ERR("dev open failed.");
+ 			return OFFLOAD_FAIL;
+ 		}
+-		ret = doca_devinfo_rep_list_create(
+-			dev, DOCA_DEV_REP_FILTER_NET, &rep_dev_list, &devinfo.total_rep_devices
++		ret = doca_devinfo_rep_create_list(
++			dev, DOCA_DEVINFO_REP_FILTER_NET, &rep_dev_list, &devinfo.total_rep_devices
+ 		);
+ 		if (ret != DOCA_SUCCESS) {
+ 			DOCA_LOG_ERR("devinfo_rep_list_create failed.");
+@@ -577,7 +564,7 @@ int bf_init_deviceinfo()
+ 		}
+ 		devinfo.rep = (struct rep_devinfo *)malloc(devinfo.total_rep_devices * sizeof(struct rep_devinfo));
+ 		for (j = 0; j < devinfo.total_rep_devices; ++j) {
+-			ret = doca_devinfo_rep_get_is_list_all_supported(
++			ret = doca_devinfo_rep_cap_is_filter_all_supported(
+ 				doca_dev_list[i], &devinfo.rep_support);
+ 			if (ret != DOCA_SUCCESS) {
+ 				DOCA_LOG_ERR("devinfo failed [rep support]");
+@@ -598,7 +585,7 @@ int bf_init_deviceinfo()
+ 			}
+ #endif
+ 		}
+-		doca_devinfo_rep_list_destroy(rep_dev_list);
++		doca_devinfo_rep_destroy_list(rep_dev_list);
+ 		doca_dev_close(dev);
+ 		dev_list[k].info = devinfo;
+ 		++k;
+@@ -613,7 +600,7 @@ void bf_deinit_deviceinfo()
+ 		free(dev_list[j].info.rep);
+ 	}
+ 	free(dev_list);
+-	doca_devinfo_list_destroy(doca_dev_list);
++	doca_devinfo_destroy_list(doca_dev_list);
+ 
+ }
+ 
+@@ -626,65 +613,27 @@ int bf_init_connection(int id, char type, const char *server_name, struct bf_con
+ 	struct doca_dev      *doca_dev = devinfo.doca_dev;
+ 	struct doca_dev_rep   *rep_dev;
+ 
+-	ret = doca_comm_channel_ep_create(&conn->ep);
+-	if (ret != DOCA_SUCCESS) {
+-		DOCA_LOG_ERR("failed to create ep");
+-		return OFFLOAD_FAIL;
+-	}
+-	DOCA_LOG_DBG("created ep");
+-	ret = doca_comm_channel_ep_set_device(conn->ep, doca_dev);
+-	if (ret != DOCA_SUCCESS) {
+-		DOCA_LOG_ERR("failed to set doca_dev in ep");
+-		return OFFLOAD_FAIL;
+-	}
+-
+ 	if (type == SERVER_MODE) {
+ 		rep_dev = devinfo.rep[0].rep_dev;
+-		doca_comm_channel_ep_set_device_rep(conn->ep, rep_dev);
++		ret = odos_comch_server_start(&conn->cc, doca_dev, rep_dev, server_name);
+ 		if (ret != DOCA_SUCCESS) {
+-			DOCA_LOG_ERR("failed to set rep_dev in ep");
+-			return OFFLOAD_FAIL;
+-		}
+-		printf("[server] server name: %s\n", server_name);
+-		ret = doca_comm_channel_ep_listen(conn->ep, server_name);
+-		if (ret != DOCA_SUCCESS) {
+-			DOCA_LOG_ERR("dpu is NOT listening :(");
++			DOCA_LOG_ERR("dpu is NOT listening :( [%s]", doca_error_get_name((doca_error_t)ret));
+ 			puts("dpu is NOT listening :(");
+-			return DOCA_ERROR_INITIALIZATION;
++			return OFFLOAD_FAIL;
+ 		}
+ 		DOCA_LOG_INFO("dpu is listening...");
+-		//puts("dpu is listening...");
++		printf("[server] listening as %s\n", server_name);
+ 	} else {
+ 		DOCA_LOG_INFO("going to connect....");
+-		ret = doca_comm_channel_ep_connect(conn->ep, server_name, &conn->peer);
++		/* Not used by the service, which only runs as the server. */
++		ret = odos_comch_client_connect(&conn->cc, doca_dev, server_name, 30);
+ 		if (ret != DOCA_SUCCESS) {
+-			DOCA_LOG_ERR("host failed to connect :(");
++			DOCA_LOG_ERR("host failed to connect :( [%s]", doca_error_get_name((doca_error_t)ret));
+ 			return OFFLOAD_FAIL;
+ 		}
+ 		DOCA_LOG_INFO("connected");
+-
+-		while (
+-			doca_comm_channel_peer_addr_update_info(conn->peer) \
+-				== DOCA_ERROR_CONNECTION_INPROGRESS
+-		);
+-		DOCA_LOG_DBG("updated peer addr info");
+-	}
+-
+-
+-	conn->epoll_fd = epoll_create1(0);
+-
+-	doca_comm_channel_ep_get_event_channel(conn->ep, &conn->send_fd, &conn->recv_fd);
+-
+-	conn->recv_event.events  = EPOLLIN;
+-	conn->recv_event.data.fd = conn->recv_fd;
+-
+-	ret = epoll_ctl(conn->epoll_fd, EPOLL_CTL_ADD, conn->recv_fd, &conn->recv_event);
+-	if (ret == -1) {
+-		DOCA_LOG_ERR("epoll failed.");
+-		return OFFLOAD_FAIL;
+ 	}
+ 
+-
+ 	return 0;
+ }
+ 
+@@ -700,7 +649,6 @@ int bf_init_device(int id, char type, const char *server_name)
+ 
+ 	struct doca_dev_rep      **rep_dev;
+ 	struct doca_devinfo_rep ** rep_dev_list;
+-	struct doca_pci_bdf       rep_pci_bdf;
+ 
+ 	dev_list[id].total_libraries = 0;
+ 
+@@ -717,20 +665,12 @@ int bf_init_device(int id, char type, const char *server_name)
+ 	if (type == SERVER_MODE) {
+ 		rep_dev = &devinfo->rep[0].rep_dev;
+ 
+-		ret = doca_devinfo_rep_list_create( \
+-			*doca_dev, DOCA_DEV_REP_FILTER_NET, &rep_dev_list, &total_rep_devices
+-		);
+-		DOCA_LOG_INFO("total rep devices: %d\n", total_rep_devices);
+-
+-		doca_dev_rep_open(rep_dev_list[0], rep_dev);
++		ret = odos_comch_open_rep(*doca_dev, rep_dev);
+ 
+-		if (*rep_dev == NULL) {
++		if (ret != DOCA_SUCCESS || *rep_dev == NULL) {
+ 			DOCA_LOG_ERR("failed to open device.");
+ 			return DOCA_ERROR_INITIALIZATION;
+ 		}
+-		doca_devinfo_rep_get_pci_addr(rep_dev_list[0], &rep_pci_bdf);
+-		DOCA_LOG_DBG("opened rep device: %02X:%02X:%X\n", rep_pci_bdf.bus, rep_pci_bdf.device, rep_pci_bdf.function);
+-		doca_devinfo_rep_list_destroy(rep_dev_list);
+ 	}
+ 
+ 	DOCA_LOG_DBG("opened device");
+@@ -748,7 +688,11 @@ int bf_init_device(int id, char type, const char *server_name)
+ 
+ void bf_deinit_device(int id)
+ {
+-	doca_comm_channel_ep_destroy(dev_list[id].conn.ep);
++	odos_comch_destroy(&dev_list[id].conn.cc);
++	if (dev_list[id].info.rep != NULL && dev_list[id].info.rep[0].rep_dev != NULL) {
++		doca_dev_rep_close(dev_list[id].info.rep[0].rep_dev);
++		dev_list[id].info.rep[0].rep_dev = NULL;
++	}
+ 	doca_dev_close(dev_list[id].info.doca_dev);
+ }
+ 
+@@ -769,7 +713,7 @@ void deinit_server()
+ {
+ 	bf_deinit_device(0);
+ 	bf_deinit_deviceinfo();
+-	doca_log_global_level_set(DOCA_LOG_LEVEL_CRIT);
++	odos_doca_log_level_set(DOCA_LOG_LEVEL_CRIT);
+ 	return;
+ }
+ 
+@@ -781,7 +725,10 @@ int run_service()
+ 	size_t msglen = sizeof(cmd);
+ 
+ 	while (1) {
+-		bf_recv_buf(conn, &cmd, sizeof(cmd));
++		if (bf_recv_buf(conn, &cmd, sizeof(cmd)) != 0) {
++			DOCA_LOG_INFO("host disconnected");
++			break;
++		}
+ 		DOCA_LOG_DBG("cmd: %d\n", cmd.cmd);
+ 		switch(cmd.cmd) {
+ 			case CMD_LOAD_BINARY:
+@@ -822,7 +769,7 @@ deinit:
+ int main(int argc, char *argv[])
+ {
+ 	int ret;
+-	doca_log_global_level_set(DOCA_LOG_LEVEL_CRIT);
++	odos_doca_log_level_set(DOCA_LOG_LEVEL_CRIT);
+ 
+ 	while (1) {
+ 		ret = init_server();

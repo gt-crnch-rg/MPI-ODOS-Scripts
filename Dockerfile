@@ -53,6 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         pkg-config \
         zlib1g-dev libnuma-dev libffi-dev libelf-dev \
         libibverbs-dev librdmacm-dev rdma-core \
+        openssh-client \
     && rm -rf /var/lib/apt/lists/*
 
 # Recent CMake (cluster used 3.26.4; Ubuntu 22.04 ships 3.22) from Kitware.
@@ -75,16 +76,34 @@ RUN printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/module \
 COPY --from=doca . ${DOCA_PATH}/
 
 # ---------------------------------------------------------------------------
+# 2b) DOCA's rdma-core. DOCA >= 3.x libraries need newer libibverbs/libmlx5
+#     symbol versions (e.g. MLX5_1.25) than Ubuntu 22.04's rdma-core 39, so
+#     install the rdma-core that ships with the imported DOCA release, from
+#     NVIDIA's DOCA apt repo. DOCA_REPO_VERSION defaults to <major>.<minor>.0
+#     of ${DOCA_PATH}/VERSION (e.g. 3.5.0098 -> 3.5.0). Newer repos ship a binary
+#     doca_keyring.gpg, older ones (3.3.0) an ASCII GPG-KEY-Mellanox.pub.
+# ---------------------------------------------------------------------------
+ARG DOCA_REPO_VERSION=
+RUN V="${DOCA_REPO_VERSION:-$(cut -d. -f1,2 "$DOCA_PATH/VERSION").0}" \
+    && R="https://linux.mellanox.com/public/repo/doca/$V/ubuntu22.04/x86_64" \
+    && { wget -qO /tmp/doca-key "$R/doca_keyring.gpg" && mv /tmp/doca-key /usr/share/keyrings/doca.gpg; } \
+       || { wget -qO- "$R/GPG-KEY-Mellanox.pub" | gpg --batch --yes --dearmor -o /usr/share/keyrings/doca.gpg; } \
+    && echo "deb [signed-by=/usr/share/keyrings/doca.gpg] $R/ ./" > /etc/apt/sources.list.d/doca.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
+        libibverbs1 ibverbs-providers librdmacm1 rdma-core libibverbs-dev librdmacm-dev \
+    && rm -rf /var/lib/apt/lists/* \
+    && ! LD_LIBRARY_PATH="$DOCA_PATH/lib/x86_64-linux-gnu" \
+         ldd "$DOCA_PATH/lib/x86_64-linux-gnu/libdoca_comch.so" 2>&1 | grep "not found"
+
+# ---------------------------------------------------------------------------
 # 3) Path aliases so hard-coded cluster paths resolve in this container:
 #       <rocky DOCA path>  -> ${DOCA_PATH}
-#       ${DOCA_PATH}/lib64 -> DOCA 3.3 Ubuntu lib dir
+#       ${DOCA_PATH}/lib64 -> DOCA >= 3.x Ubuntu lib dir
 #       <rocky cmake path> -> system cmake
 #
-#    NOTE: DOCA 3.3 renamed libdoca_comm_channel -> libdoca_comch and uses
-#    lib/x86_64-linux-gnu instead of lib64. compile_3_ompi.sh (DOCA MCA) and
-#    compile_2_odos.sh (OpenMP-offload) link against the old names and may need
-#    source updates for 3.3. compile_1_ucx.sh and compile_4_pnetcdf.sh are
-#    unaffected.
+#    DOCA >= 3.x installs its libraries under lib/x86_64-linux-gnu; the lib64
+#    alias keeps the cluster-era paths working. The DOCA 2.0 Comm Channel ->
+#    Comch source port is in patches/, applied by setup.sh (apply_patches.sh).
 # ---------------------------------------------------------------------------
 RUN mkdir -p "$(dirname "$ROCKY_DOCA")" "$(dirname "$ROCKY_CMAKE")" \
     && ln -sfn "$DOCA_PATH" "$ROCKY_DOCA" \
@@ -107,8 +126,8 @@ RUN bash install_odos_prereqs.sh
 
 # Make freshly built Open MPI / ODOS-clang visible to later compile steps
 # (compile_4_pnetcdf.sh needs mpicc; non-existent paths on PATH are harmless).
-ENV PATH=${APP_ROOT}/build/ompi/x86_64/install/bin:${APP_ROOT}/build/odos/install/bin:${PATH}
-ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${DOCA_PATH}/lib64:${LD_LIBRARY_PATH}
+ENV PATH=${APP_ROOT}/build/ompi/x86_64/install/bin:${APP_ROOT}/build/odos/install/bin:${APP_ROOT}/build/ucx/x86_64/install/bin:${PATH}
+ENV LD_LIBRARY_PATH=${APP_ROOT}/build/ompi/x86_64/install/lib:${APP_ROOT}/build/ucx/x86_64/install/lib:${APP_ROOT}/build/odos/install/lib:${APP_ROOT}/build/pnetcdf/install/lib:${DOCA_PATH}/lib64
 ENV OPAL_PREFIX=${APP_ROOT}/build/ompi/x86_64/install
 
 # ---------------------------------------------------------------------------
@@ -142,6 +161,15 @@ RUN sh compile_3_ompi.sh \
 # 10) compile_4_pnetcdf.sh — Parallel NetCDF
 # ---------------------------------------------------------------------------
 RUN sh compile_4_pnetcdf.sh ./build/pnetcdf
+
+# ---------------------------------------------------------------------------
+# 11) verify_build.sh — the compile scripts have no `set -e`, so without this
+#     a failed build step still produces a "successful" image.
+#     REQUIRE_DOCA=1 (the default) also requires the ODOS/DOCA components;
+#     pass --build-arg REQUIRE_DOCA=0 to accept a stock-only build.
+# ---------------------------------------------------------------------------
+ARG REQUIRE_DOCA=1
+RUN REQUIRE_DOCA=${REQUIRE_DOCA} sh verify_build.sh ./build
 
 # Applications (apps/) and the SLURM run stage are left to the user;
 # see apps/README.md.
