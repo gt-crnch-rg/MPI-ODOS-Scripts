@@ -7,7 +7,7 @@
 #   ODOS_SERVICE       ref   -- doca-omp-service (OpenMP offload only; default)
 #                      mpi   -- doca-omp-service-mpi (also used by ODOS MPI)
 #   ODOS_MPI_VARIANT   Open MPI build for ODOS_SERVICE=mpi, matching the
-#                      host application (apps/run_service_mpi*.sh):
+#                      host application's (apps/README.md):
 #                      ref (default) | pt2pt | one-sided
 #   ODOS_MPIRUN_ARGS   if set, ODOS_SERVICE=mpi runs under
 #                      `mpirun $ODOS_MPIRUN_ARGS`, e.g. "-np 2 -H dpu1,dpu2";

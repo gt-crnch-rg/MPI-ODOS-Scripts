@@ -229,8 +229,10 @@ What has been verified, and what has not:
   compared byte for byte, across reconnects. The DPU service must run as
   root. See "What has been tested" and "Round-trip test" in
   [dpu_scripts/DPU_README.md](dpu_scripts/DPU_README.md).
-- **Not yet run:** a real ODOS OpenMP offload or MPI application across host
-  and DPU.
+- ODOS OpenMP offload runs end to end: the four tasks in
+  [apps/simple_tasks](apps/simple_tasks/README.md) pass against the DPU
+  service.
+- **Not yet run:** an ODOS MPI application across host and DPU.
 
 `compile_3_ompi.sh` builds each ODOS plugin *before* renaming the stock
 component to `orig.mca_*_ucx.so`, so a failed plugin build leaves working stock
@@ -244,14 +246,11 @@ UCX components in place. It also gives the plugin `cmake` invocation:
   `__sync_val_compare_and_swap_16` call that no library provides, which only
   fails once that code path runs.
 
-### App submodules and the `pkg/` tree
+### App submodules
 
 `apps/omb-odos` and `apps/miniweather` are git submodules (public, on GitHub —
 see `.gitmodules`) and are excluded from the build context by `.dockerignore`,
-so the application compile stage is not part of this Dockerfile.
-
-`apps/compile.sh` also reads from a `pkg/` tree produced by `prepare_pkg.sh`,
-which the image does not create: `prepare_pkg.sh` requires the aarch64 UCX and
-Open MPI builds and the DPU service, all out of scope for an x86_64 host image.
-Building the applications therefore needs either a DPU-side build as well, or a
-host-only variant of `prepare_pkg.sh`. Refer to `apps/README.md`.
+so the application compile stage is not part of this Dockerfile. The apps are
+compiled in a container of the `odos-mpi-dev` image instead, which adds the
+aarch64 cross toolchain to this one. See `apps/README.md` and
+`apps/simple_tasks/README.md`.

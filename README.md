@@ -25,12 +25,6 @@ Wait for commands to complete. Check if done in `squeue`.
 - Host (x86_64): see [DOCKER.md](DOCKER.md).
 - DPU (BlueField, aarch64): see [dpu_scripts/DPU_README.md](dpu_scripts/DPU_README.md).
 
-## Prepare Package
-
-```
-. prepare_pkg.sh
-```
-
 ## Run Applications
 
 Refer to `README.md` in `apps` to run applications

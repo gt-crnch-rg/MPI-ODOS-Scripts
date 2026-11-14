@@ -158,7 +158,7 @@ is configured through the environment (`env:` in the manifest):
 | Variable | Values | Meaning |
 |----------|--------|---------|
 | `ODOS_SERVICE` | `ref` (default), `mpi` | which service binary to run |
-| `ODOS_MPI_VARIANT` | `ref` (default), `pt2pt`, `one-sided` | Open MPI variant for `mpi`; match the host application, as `apps/run_service_mpi*.sh` do |
+| `ODOS_MPI_VARIANT` | `ref` (default), `pt2pt`, `one-sided` | Open MPI variant for `mpi`; must match the variant the host application runs with (see [apps/README.md](../apps/README.md#running)) |
 | `ODOS_MPIRUN_ARGS` | e.g. `-np 2 -H dpu1,dpu2` | run `mpi` under `mpirun` across DPUs (needs ssh between the DPU containers); unset = one process |
 | `ODOS_COMCH_REP_PCI` | PCI address | representor the service listens on; default the first non-uplink network representor |
 
@@ -188,8 +188,8 @@ to run on anything but aarch64, or against DOCA older than 3.3.
 
 ## What has been tested
 
-All of the following was done on dash2-bf3-2 (BlueField-3, Ubuntu 24.04,
-DOCA 3.5.0098, rdma-core 2607), first as an unprivileged user:
+All of the following was done on a BlueField-3 (Ubuntu 24.04, DOCA 3.5.0098,
+rdma-core 2607), first as an unprivileged user:
 
 - The image builds under QEMU. `verify_build.sh` passes in both stages with
   `REQUIRE_DOCA=1`.
@@ -204,10 +204,10 @@ DOCA 3.5.0098, rdma-core 2607), first as an unprivileged user:
 Then as root:
 
 - The service listens (`[server] listening as omp_test0`). By default it
-  uses the representor of the host PF, `0000:27:00.0` on dash2, so
+  uses the representor of the host PF, `0000:27:00.0` on the test host, so
   `ODOS_COMCH_REP_PCI` was not needed.
 - A host ↔ DPU round trip passed using the [round-trip test](#round-trip-test),
-  run from dash2 in the host image. Over two sessions, buffers of 8 B to
+  run from the BlueField's host in the host image. Over two sessions, buffers of 8 B to
   16 MB were submitted, retrieved and compared byte for byte. The service
   returned to listening after each disconnect. The service under test was an
   ASan/UBSan build, which reported no errors.
@@ -220,8 +220,13 @@ Then as root:
   Removing the manifest stops the pod in under a second: the launcher passes
   the kubelet's SIGTERM on to the service.
 
-**Not yet tested:** a real ODOS OpenMP offload or MPI application across host
-and DPU.
+- ODOS OpenMP offload works end to end. The four tasks in
+  [apps/simple_tasks](../apps/simple_tasks/README.md) ran from the host dev
+  image against this image, deployed as a kubelet static pod and pulled from
+  Docker Hub. The host had two BlueField-3 DPUs, so task d's TCP ping-pong ran
+  between them.
+
+**Not yet tested:** an ODOS MPI application across host and DPU.
 
 ## Round-trip test
 

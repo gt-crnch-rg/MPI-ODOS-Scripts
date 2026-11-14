@@ -1,7 +1,7 @@
 #!/bin/sh
 #
-# Installs the DPU build into a self-contained runtime tree -- the DPU half of
-# prepare_pkg.sh. Used by dpu_scripts/Dockerfile; also works on a DPU directly.
+# Installs the DPU build into a self-contained runtime tree. Used by
+# dpu_scripts/Dockerfile; also works on a DPU directly.
 #
 # usage: sh dpu_scripts/install_dpu.sh [build root] [prefix]
 #        (defaults: ./build  /opt/odos-dpu)
