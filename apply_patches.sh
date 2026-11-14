@@ -9,13 +9,18 @@
 #     to every source file that includes it
 #
 # The patches are made against the commits clone_repos.sh pins. Patches that
-# are already applied are skipped, so rerunning is safe.
+# are already applied are skipped, so rerunning is safe. Repos that were not
+# cloned (e.g. ODOS for the DPU build) are skipped.
 
 set -e
 
 P=`pwd`/patches
 
 for repo in ODOS ompi-bf doca-omp-service; do
+	if [ ! -d "repos/$repo" ]; then
+		echo "not cloned, skipped: $repo"
+		continue
+	fi
 	for patch in "$P/$repo"/*.patch; do
 		name="$repo/`basename "$patch"`"
 		if git -C "repos/$repo" apply --reverse --check "$patch" 2>/dev/null; then
@@ -32,5 +37,6 @@ for dir in repos/ODOS/openmp/libomptarget/plugins/bf/src \
            repos/ompi-bf/ompi/mca/osc/ucx \
            repos/doca-omp-service/ref \
            repos/doca-omp-service/mpi; do
+	[ -d "$dir" ] || continue
 	cp "$P/odos_comch.h" "$dir/"
 done

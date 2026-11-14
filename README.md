@@ -20,6 +20,11 @@ Compile UCX, ODOS, ODOS-MPI, OSU Microbenchmarks, Parallel NetCDF and MiniWeathe
 
 Wait for commands to complete. Check if done in `squeue`.
 
+## Docker (DOCA 3.3+)
+
+- Host (x86_64): see [DOCKER.md](DOCKER.md).
+- DPU (BlueField, aarch64): see [dpu_scripts/DPU_README.md](dpu_scripts/DPU_README.md).
+
 ## Prepare Package
 
 ```

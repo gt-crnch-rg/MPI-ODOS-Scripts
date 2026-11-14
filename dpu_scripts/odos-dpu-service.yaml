@@ -1,0 +1,36 @@
+# Kubelet static pod for the ODOS DPU service -- the way BlueField runs DOCA
+# services (standalone kubelet + containerd). On the DPU, as root:
+#
+#   cp odos-dpu-service.yaml /etc/kubelet.d/      # start
+#   rm /etc/kubelet.d/odos-dpu-service.yaml       # stop
+#
+# Set `image` to what you pushed. See dpu_scripts/DPU_README.md.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: odos-dpu-service
+spec:
+  hostNetwork: true
+  restartPolicy: Always
+  containers:
+    - name: odos-dpu-service
+      image: docker.io/<username>/odos-smartnic:odos-mpi-dpu-v1
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        privileged: true          # RDMA devices (/dev/infiniband) for DOCA Comch
+      env:
+        - name: ODOS_SERVICE      # ref | mpi
+          value: "ref"
+        - name: ODOS_MPI_VARIANT  # ref | pt2pt | one-sided (ODOS_SERVICE=mpi)
+          value: "ref"
+        # - name: ODOS_COMCH_REP_PCI   # representor to listen on (default: first non-uplink)
+        #   value: "0000:03:00.0"
+      volumeMounts:
+        - name: doca
+          mountPath: /opt/mellanox/doca
+          readOnly: true
+  volumes:
+    - name: doca
+      hostPath:
+        path: /opt/mellanox/doca
+        type: Directory

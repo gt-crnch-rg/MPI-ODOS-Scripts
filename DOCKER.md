@@ -27,9 +27,10 @@ for the x86_64 host, running each compile script as a separate Docker layer:
 | 8 | `compile_4_pnetcdf.sh` | Parallel NetCDF |
 | 9 | `verify_build.sh` | Asserts the artifacts above actually exist |
 
-**Out of scope** (requires an aarch64/BlueField host):
-- `dpu_scripts/compile_dpu.sh` — aarch64 UCX + Open MPI
-- `dpu_scripts/compile_5_service.sh` — DPU service (`armclang` only)
+**Out of scope** for this image:
+- The DPU side (aarch64 UCX + Open MPI, `doca-omp-service`). It has its own
+  image, `dpu_scripts/Dockerfile`; see
+  [dpu_scripts/DPU_README.md](dpu_scripts/DPU_README.md).
 - The SLURM run stage (`sbatch` / `squeue`)
 
 ## Build
@@ -222,12 +223,12 @@ What has been verified, and what has not:
 - `patches/test/test_odos_comch.c` runs the ODOS protocol through
   `odos_comch.h` against a mock of the Comch API (asynchronous sends, few
   send slots, reconnects), under ASan/UBSan.
-- **Not yet run on hardware.** A real host ↔ DPU round trip still needs to be
-  tested on a BlueField.
-- The DPU-side scripts (`dpu_scripts/compile_dpu.sh`,
-  `compile_5_service.sh`) still point at the cluster's DOCA 2.0.2 module
-  paths, and `dpu_scripts/Dockerfile` does not yet install DOCA's arm64
-  rdma-core; both need updating for a DOCA 3.x DPU build.
+- The DPU side builds against DOCA ≥ 3.3 with `dpu_scripts/`. Its binaries
+  load and resolve against a real BlueField-3's DOCA 3.5. The DPU service has
+  to run as root, which this testing did not have (see "What has been tested"
+  in [dpu_scripts/DPU_README.md](dpu_scripts/DPU_README.md)).
+- **Not yet run end to end.** A host ↔ DPU round trip still needs to be tested
+  on a BlueField, with the DPU service running as root.
 
 `compile_3_ompi.sh` builds each ODOS plugin *before* renaming the stock
 component to `orig.mca_*_ucx.so`, so a failed plugin build leaves working stock
