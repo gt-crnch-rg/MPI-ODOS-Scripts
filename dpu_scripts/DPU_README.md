@@ -189,7 +189,7 @@ to run on anything but aarch64, or against DOCA older than 3.3.
 ## What has been tested
 
 All of the following was done on dash2-bf3-2 (BlueField-3, Ubuntu 24.04,
-DOCA 3.5.0098, rdma-core 2607) as an unprivileged user:
+DOCA 3.5.0098, rdma-core 2607), first as an unprivileged user:
 
 - The image builds under QEMU. `verify_build.sh` passes in both stages with
   `REQUIRE_DOCA=1`.
@@ -201,9 +201,49 @@ DOCA 3.5.0098, rdma-core 2607) as an unprivileged user:
   run as root (see above). Under ASan/UBSan, the failure path reports cleanly,
   retries without leaking file descriptors, and exits on SIGTERM.
 
-**Not yet tested:** the service as root, i.e. the Comch server actually
-listening; a host ↔ DPU round trip; and deployment through
-`/etc/kubelet.d`. All three need root on the DPU.
+Then as root:
+
+- The service listens (`[server] listening as omp_test0`). By default it
+  uses the representor of the host PF, `0000:27:00.0` on dash2, so
+  `ODOS_COMCH_REP_PCI` was not needed.
+- A host ↔ DPU round trip passed using the [round-trip test](#round-trip-test),
+  run from dash2 in the host image. Over two sessions, buffers of 8 B to
+  16 MB were submitted, retrieved and compared byte for byte. The service
+  returned to listening after each disconnect. The service under test was an
+  ASan/UBSan build, which reported no errors.
+
+**Not yet tested:** deployment through `/etc/kubelet.d`, and a real ODOS
+OpenMP offload or MPI application.
+
+## Round-trip test
+
+[test/run_roundtrip.sh](test/run_roundtrip.sh) is a smoke test of the
+host ↔ DPU link. It builds [test/rt_client.c](test/rt_client.c), which speaks
+the service's own protocol over `patches/odos_comch.h`. The client connects to
+the running service, then sends and retrieves buffers from 8 B to 16 MB and
+compares every byte. It runs two sessions, so it also checks that the service
+accepts a new host after one disconnects.
+
+Start the service on the DPU (as root, see above). Then, on the x86_64 host of
+that BlueField, from the repo root:
+
+```bash
+# host PF of the BlueField: lspci | grep BlueField  (e.g. 27:00.0)
+sh dpu_scripts/test/run_roundtrip.sh 0000:27:00.0
+```
+
+The script needs a C compiler and the host's DOCA at `/opt/mellanox/doca`
+(override with `DOCA_PATH`). Running it in the single-stage host image works
+too; the two-stage image has no compiler:
+
+```bash
+docker run --rm --device=/dev/infiniband --ulimit memlock=-1 \
+  -v /opt/mellanox/doca:/opt/mellanox/doca:ro -v "$PWD":/w -w /w \
+  odos-mpi sh dpu_scripts/test/run_roundtrip.sh 0000:27:00.0
+```
+
+It ends with `OK: all round trips passed` (exit 0), or `FAIL` and a non-zero
+exit.
 
 ## Verify a build
 

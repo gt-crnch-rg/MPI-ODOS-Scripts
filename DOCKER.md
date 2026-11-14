@@ -223,12 +223,14 @@ What has been verified, and what has not:
 - `patches/test/test_odos_comch.c` runs the ODOS protocol through
   `odos_comch.h` against a mock of the Comch API (asynchronous sends, few
   send slots, reconnects), under ASan/UBSan.
-- The DPU side builds against DOCA ≥ 3.3 with `dpu_scripts/`. Its binaries
-  load and resolve against a real BlueField-3's DOCA 3.5. The DPU service has
-  to run as root, which this testing did not have (see "What has been tested"
-  in [dpu_scripts/DPU_README.md](dpu_scripts/DPU_README.md)).
-- **Not yet run end to end.** A host ↔ DPU round trip still needs to be tested
-  on a BlueField, with the DPU service running as root.
+- The DPU side builds against DOCA ≥ 3.3 with `dpu_scripts/`. On a
+  BlueField-3 with DOCA 3.5.0098, a host ↔ DPU round trip through
+  `odos_comch.h` and the ported service passes: buffers of 8 B to 16 MB,
+  compared byte for byte, across reconnects. The DPU service must run as
+  root. See "What has been tested" and "Round-trip test" in
+  [dpu_scripts/DPU_README.md](dpu_scripts/DPU_README.md).
+- **Not yet run:** a real ODOS OpenMP offload or MPI application across host
+  and DPU.
 
 `compile_3_ompi.sh` builds each ODOS plugin *before* renaming the stock
 component to `orig.mca_*_ucx.so`, so a failed plugin build leaves working stock
