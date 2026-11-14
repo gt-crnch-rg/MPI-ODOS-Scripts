@@ -8,6 +8,12 @@ DOCA >= 3.0 Comch (Comm Channel was removed in DOCA 3.x).
   representor is closed on teardown
 * CMake: minimum 3.10 (CMake 4 rejects 3.0); armclang stays the default but
   -DCMAKE_C_COMPILER now overrides it; link libdoca_comch
+* initialisation failures are reported instead of crashing: init_server()
+  used to ignore bf_init_deviceinfo()'s result and dereference an unset
+  representor (SIGSEGV, e.g. when not run as root on the DPU, where listing
+  representors fails). It now prints why once on stderr (logging is limited
+  to CRIT) and retries every second instead of spinning; the device opened
+  on that path is closed, and teardown is safe to repeat
 
 Against usman0xff/doca-omp-service 655b3b555abc7800d336f6eb9f4aaf5335552eaf.
 
@@ -62,10 +68,18 @@ index 18f95d4..5214d2d 100644
  	${MPI_PATH}/lib/libmpi.so
  )
 diff --git a/mpi/doca-omp-service.c b/mpi/doca-omp-service.c
-index b074649..4c96abd 100644
+index b074649..c9e7832 100644
 --- a/mpi/doca-omp-service.c
 +++ b/mpi/doca-omp-service.c
-@@ -13,9 +13,10 @@
+@@ -5,6 +5,7 @@
+ #include <stdio.h>
+ #include <stdarg.h>
+ #include <stdlib.h>
++#include <unistd.h>
+ #include <pthread.h>
+ #include <sys/epoll.h>
+ 
+@@ -13,9 +14,10 @@
  #include <link.h>
  
  #include <doca_dev.h>
@@ -78,7 +92,7 @@ index b074649..4c96abd 100644
  
  #define SERVER_NAME "omp_test0"
  
-@@ -67,7 +68,7 @@ enum BF_COMMANDS {
+@@ -67,7 +69,7 @@ enum BF_COMMANDS {
  
  struct rep_devinfo {
  	char vuid[DOCA_DEVINFO_VUID_SIZE];
@@ -87,7 +101,7 @@ index b074649..4c96abd 100644
  
  	struct doca_dev_rep *rep_dev;
  };
-@@ -91,7 +92,7 @@ struct bf_info {
+@@ -91,7 +93,7 @@ struct bf_info {
  	unsigned char ipv4_addr[DOCA_DEVINFO_IPV4_ADDR_SIZE];
  	unsigned char ipv6_addr[DOCA_DEVINFO_IPV6_ADDR_SIZE];
  	
@@ -96,7 +110,7 @@ index b074649..4c96abd 100644
  	
  	struct mmap_support mmap_support;
  	struct comm_channel cc;
-@@ -105,15 +106,7 @@ struct bf_info {
+@@ -105,15 +107,7 @@ struct bf_info {
  
  
  struct bf_conn {
@@ -113,7 +127,7 @@ index b074649..4c96abd 100644
  
  	char sbuf[__MAX_SZ__];
  	char rbuf[__MAX_SZ__];
-@@ -154,7 +147,8 @@ int bf_send_buf(struct bf_conn *conn, void *buf, size_t sz)
+@@ -154,7 +148,8 @@ int bf_send_buf(struct bf_conn *conn, void *buf, size_t sz)
  			len = __MAX_SZ__;
  		else
  			len = sz - sent_len;
@@ -123,7 +137,7 @@ index b074649..4c96abd 100644
  		if (ack_reset > __ACK_RESET__) {
  			bf_recv_buf(conn, conn->rbuf, __MAX_SZ__);
  			//printf("ack after %ld bytes.\n", sent_len);
-@@ -175,12 +169,8 @@ int bf_recv_buf(struct bf_conn *conn, void *buf, size_t sz)
+@@ -175,12 +170,8 @@ int bf_recv_buf(struct bf_conn *conn, void *buf, size_t sz)
  			len = __MAX_SZ__;
  		else
  			len = sz - recvd_len;
@@ -138,7 +152,7 @@ index b074649..4c96abd 100644
  		if (ack_reset > __ACK_RESET__) {
  			bf_send_buf(conn, conn->sbuf, __MAX_SZ__);
  			//printf("ack after %ld bytes.\n", recvd_len);
-@@ -384,7 +374,7 @@ int process_cmd_run_target_region(struct bf_openmp_cmd *cmd)
+@@ -384,7 +375,7 @@ int process_cmd_run_target_region(struct bf_openmp_cmd *cmd)
  
  int process_cmd_set_info_flag(struct bf_openmp_cmd *cmd)
  {
@@ -147,7 +161,7 @@ index b074649..4c96abd 100644
  	return 0;
  }
  
-@@ -396,8 +386,7 @@ void bf_print_deviceinfo(int id)
+@@ -396,8 +387,7 @@ void bf_print_deviceinfo(int id)
  	printf("        iface     :  %s\n", devinfo.iface);
  	printf("        ib dev    :  %s\n", devinfo.ibdev);
  	printf("        doca id   :  %d\n", devinfo.doca_id);
@@ -157,7 +171,7 @@ index b074649..4c96abd 100644
  	printf("        ipv4 addr :  %s\n", devinfo.ipv4_addr);
  	printf("        ipv6 addr :  %s\n", devinfo.ipv6_addr);
  	printf("        rep list support           :   %s\n",
-@@ -436,7 +425,7 @@ int bf_init_deviceinfo()
+@@ -436,7 +426,7 @@ int bf_init_deviceinfo()
  	struct doca_devinfo_rep ** rep_dev_list;
  
  	total_devices = 0;
@@ -166,7 +180,7 @@ index b074649..4c96abd 100644
  	if (ret != DOCA_SUCCESS) {
  		DOCA_LOG_ERR("devinfo_list_create failed.");
  		return OFFLOAD_FAIL;
-@@ -446,13 +435,12 @@ int bf_init_deviceinfo()
+@@ -446,13 +436,12 @@ int bf_init_deviceinfo()
  	for (i = 0; i < tmp_total_devices; ++i) {
  		memset((void*)&devinfo, 0, sizeof(devinfo));
  
@@ -183,7 +197,7 @@ index b074649..4c96abd 100644
  			dev_list[i], &devinfo.rep_support);
  		if (ret != DOCA_SUCCESS) {
  			DOCA_LOG_ERR("devinfo get failed.");
-@@ -468,7 +456,7 @@ int bf_init_deviceinfo()
+@@ -468,7 +457,7 @@ int bf_init_deviceinfo()
  		++total_devices;
  
  	}
@@ -192,7 +206,7 @@ index b074649..4c96abd 100644
  	if (dev_list == NULL) {
  		DOCA_LOG_ERR("failed to allocated dev_list");
  		return OFFLOAD_FAIL;
-@@ -477,9 +465,8 @@ int bf_init_deviceinfo()
+@@ -477,9 +466,8 @@ int bf_init_deviceinfo()
  	for (i = 0, k = 0; i < tmp_total_devices; ++i) {
  		memset((void*)&devinfo, 0, sizeof(devinfo));
  
@@ -204,7 +218,7 @@ index b074649..4c96abd 100644
  			continue;
  		}
  
-@@ -497,8 +484,8 @@ int bf_init_deviceinfo()
+@@ -497,8 +485,8 @@ int bf_init_deviceinfo()
  			DOCA_LOG_ERR("devinfo get failed [ibdev].");
  			return OFFLOAD_FAIL;
  		}
@@ -215,7 +229,7 @@ index b074649..4c96abd 100644
  		if (ret != DOCA_SUCCESS) {
  			DOCA_LOG_ERR("devinfo get failed [PCI].");
  			return OFFLOAD_FAIL;
-@@ -529,14 +516,14 @@ int bf_init_deviceinfo()
+@@ -529,14 +517,14 @@ int bf_init_deviceinfo()
  			return OFFLOAD_FAIL;
  		}
  #endif
@@ -232,7 +246,7 @@ index b074649..4c96abd 100644
  			doca_dev_list[i], &devinfo.cc.max_msg_size);
  		if (ret != DOCA_SUCCESS) {
  			DOCA_LOG_ERR("devinfo get failed [cc max msg size].");
-@@ -544,20 +531,20 @@ int bf_init_deviceinfo()
+@@ -544,20 +532,20 @@ int bf_init_deviceinfo()
  		}
  #if 0
  		// fails regularly
@@ -256,7 +270,7 @@ index b074649..4c96abd 100644
  			doca_dev_list[i], &devinfo.cc.max_recv_queue_size);
  		if (ret != DOCA_SUCCESS) {
  			DOCA_LOG_ERR("devinfo get failed [cc max recv queue size].");
-@@ -569,8 +556,8 @@ int bf_init_deviceinfo()
+@@ -569,16 +557,17 @@ int bf_init_deviceinfo()
  			DOCA_LOG_ERR("dev open failed.");
  			return OFFLOAD_FAIL;
  		}
@@ -267,7 +281,8 @@ index b074649..4c96abd 100644
  		);
  		if (ret != DOCA_SUCCESS) {
  			DOCA_LOG_ERR("devinfo_rep_list_create failed.");
-@@ -578,7 +565,7 @@ int bf_init_deviceinfo()
++			doca_dev_close(dev);
+ 			return OFFLOAD_FAIL;
  		}
  		devinfo.rep = (struct rep_devinfo *)malloc(devinfo.total_rep_devices * sizeof(struct rep_devinfo));
  		for (j = 0; j < devinfo.total_rep_devices; ++j) {
@@ -276,7 +291,7 @@ index b074649..4c96abd 100644
  				doca_dev_list[i], &devinfo.rep_support);
  			if (ret != DOCA_SUCCESS) {
  				DOCA_LOG_ERR("devinfo failed [rep support]");
-@@ -599,7 +586,7 @@ int bf_init_deviceinfo()
+@@ -599,22 +588,29 @@ int bf_init_deviceinfo()
  			}
  #endif
  		}
@@ -285,16 +300,33 @@ index b074649..4c96abd 100644
  		doca_dev_close(dev);
  		dev_list[k].info = devinfo;
  		++k;
-@@ -614,7 +601,7 @@ void bf_deinit_deviceinfo()
- 		free(dev_list[j].info.rep);
  	}
- 	free(dev_list);
+ 
++	return OFFLOAD_SUCCESS;
+ }
+ 
+ void bf_deinit_deviceinfo()
+ {
+ 	int j;
+-	for (j = 0; j < total_devices; ++j) {
+-		free(dev_list[j].info.rep);
++	if (dev_list != NULL) {
++		for (j = 0; j < total_devices; ++j) {
++			free(dev_list[j].info.rep);
++		}
++		free(dev_list);
+ 	}
+-	free(dev_list);
 -	doca_devinfo_list_destroy(doca_dev_list);
-+	doca_devinfo_destroy_list(doca_dev_list);
++	dev_list = NULL;
++	total_devices = 0;
++	if (doca_dev_list != NULL)
++		doca_devinfo_destroy_list(doca_dev_list);
++	doca_dev_list = NULL;
  
  }
  
-@@ -627,65 +614,27 @@ int bf_init_connection(int id, char type, const char *server_name, struct bf_con
+@@ -627,65 +623,27 @@ int bf_init_connection(int id, char type, const char *server_name, struct bf_con
  	struct doca_dev      *doca_dev = devinfo.doca_dev;
  	struct doca_dev_rep   *rep_dev;
  
@@ -347,8 +379,8 @@ index b074649..4c96abd 100644
 -				== DOCA_ERROR_CONNECTION_INPROGRESS
 -		);
 -		DOCA_LOG_DBG("updated peer addr info");
--	}
--
+ 	}
+ 
 -
 -	conn->epoll_fd = epoll_create1(0);
 -
@@ -361,13 +393,13 @@ index b074649..4c96abd 100644
 -	if (ret == -1) {
 -		DOCA_LOG_ERR("epoll failed.");
 -		return OFFLOAD_FAIL;
- 	}
- 
+-	}
+-
 -
  	return 0;
  }
  
-@@ -701,7 +650,6 @@ int bf_init_device(int id, char type, const char *server_name)
+@@ -701,7 +659,6 @@ int bf_init_device(int id, char type, const char *server_name)
  
  	struct doca_dev_rep      **rep_dev;
  	struct doca_devinfo_rep ** rep_dev_list;
@@ -375,7 +407,7 @@ index b074649..4c96abd 100644
  
  	dev_list[id].total_libraries = 0;
  
-@@ -718,20 +666,12 @@ int bf_init_device(int id, char type, const char *server_name)
+@@ -718,20 +675,12 @@ int bf_init_device(int id, char type, const char *server_name)
  	if (type == SERVER_MODE) {
  		rep_dev = &devinfo->rep[0].rep_dev;
  
@@ -383,14 +415,15 @@ index b074649..4c96abd 100644
 -			*doca_dev, DOCA_DEV_REP_FILTER_NET, &rep_dev_list, &total_rep_devices
 -		);
 -		DOCA_LOG_INFO("total rep devices: %d\n", total_rep_devices);
--
--		doca_dev_rep_open(rep_dev_list[0], rep_dev);
 +		ret = odos_comch_open_rep(*doca_dev, rep_dev);
  
+-		doca_dev_rep_open(rep_dev_list[0], rep_dev);
+-
 -		if (*rep_dev == NULL) {
 +		if (ret != DOCA_SUCCESS || *rep_dev == NULL) {
  			DOCA_LOG_ERR("failed to open device.");
- 			return DOCA_ERROR_INITIALIZATION;
+-			return DOCA_ERROR_INITIALIZATION;
++			return OFFLOAD_FAIL;
  		}
 -		doca_devinfo_rep_get_pci_addr(rep_dev_list[0], &rep_pci_bdf);
 -		DOCA_LOG_DBG("opened rep device: %02X:%02X:%X\n", rep_pci_bdf.bus, rep_pci_bdf.device, rep_pci_bdf.function);
@@ -398,20 +431,51 @@ index b074649..4c96abd 100644
  	}
  
  	DOCA_LOG_DBG("opened device");
-@@ -749,7 +689,11 @@ int bf_init_device(int id, char type, const char *server_name)
+@@ -749,20 +698,35 @@ int bf_init_device(int id, char type, const char *server_name)
  
  void bf_deinit_device(int id)
  {
 -	doca_comm_channel_ep_destroy(dev_list[id].conn.ep);
+-	doca_dev_close(dev_list[id].info.doca_dev);
++	if (dev_list == NULL || id >= total_devices)
++		return;
 +	odos_comch_destroy(&dev_list[id].conn.cc);
 +	if (dev_list[id].info.rep != NULL && dev_list[id].info.rep[0].rep_dev != NULL) {
 +		doca_dev_rep_close(dev_list[id].info.rep[0].rep_dev);
 +		dev_list[id].info.rep[0].rep_dev = NULL;
 +	}
- 	doca_dev_close(dev_list[id].info.doca_dev);
++	if (dev_list[id].info.doca_dev != NULL) {
++		doca_dev_close(dev_list[id].info.doca_dev);
++		dev_list[id].info.doca_dev = NULL;
++	}
  }
  
-@@ -770,7 +714,7 @@ void deinit_server()
+ 
++static const char *init_error;
++
+ int init_server()
+ {
+-
+-	int ret;
+-	ret = bf_init_deviceinfo();
+-	ret = bf_init_device(0, SERVER_MODE, SERVER_NAME);
+-	if (ret == OFFLOAD_FAIL)
++	init_error = NULL;
++	if (bf_init_deviceinfo() != OFFLOAD_SUCCESS || total_devices == 0) {
++		init_error = "no DOCA device usable as a Comch server with network"
++		             " representors (on the DPU this needs root)";
+ 		return ~DOCA_SUCCESS;
+-
++	}
++	if (bf_init_device(0, SERVER_MODE, SERVER_NAME) != OFFLOAD_SUCCESS) {
++		init_error = "could not open the representor or start the Comch"
++		             " server (see ODOS_COMCH_REP_PCI)";
++		return ~DOCA_SUCCESS;
++	}
+ 	return DOCA_SUCCESS;
+ }
+ 
+@@ -770,7 +734,7 @@ void deinit_server()
  {
  	bf_deinit_device(0);
  	bf_deinit_deviceinfo();
@@ -420,7 +484,7 @@ index b074649..4c96abd 100644
  	return;
  }
  
-@@ -782,7 +726,10 @@ int run_service()
+@@ -782,7 +746,10 @@ int run_service()
  	size_t msglen = sizeof(cmd);
  
  	while (1) {
@@ -432,15 +496,34 @@ index b074649..4c96abd 100644
  		DOCA_LOG_DBG("cmd: %d\n", cmd.cmd);
  		switch(cmd.cmd) {
  			case CMD_LOAD_BINARY:
-@@ -823,7 +770,7 @@ deinit:
+@@ -823,7 +790,8 @@ deinit:
  int main(int argc, char *argv[])
  {
  	int ret;
 -	doca_log_global_level_set(DOCA_LOG_LEVEL_CRIT);
++	int reported = 0;
 +	odos_doca_log_level_set(DOCA_LOG_LEVEL_CRIT);
  
  	puts("init...");
  	MPI_Init(NULL, NULL);
+@@ -831,9 +799,17 @@ int main(int argc, char *argv[])
+ 	while (1) {
+ 		ret = init_server();
+ 		if (ret == DOCA_SUCCESS) {
++			reported = 0;
+ 			run_service();
++		} else if (!reported) {
++			/* logging is limited to CRIT, so say why on stderr, once */
++			fprintf(stderr, "doca-omp-service: initialisation failed: %s;"
++			        " retrying every second\n", init_error);
++			reported = 1;
+ 		}
+ 		deinit_server();
++		if (ret != DOCA_SUCCESS)
++			sleep(1);
+ 	}
+ 	MPI_Finalize();
+ 	return 0;
 diff --git a/ref/CMakeLists.txt b/ref/CMakeLists.txt
 index 82f366f..a93d8a6 100644
 --- a/ref/CMakeLists.txt
@@ -490,10 +573,18 @@ index 82f366f..a93d8a6 100644
 +	${additional_libs}
  )
 diff --git a/ref/doca-omp-service.c b/ref/doca-omp-service.c
-index 45e1d80..d6bea0b 100644
+index 45e1d80..63c5828 100644
 --- a/ref/doca-omp-service.c
 +++ b/ref/doca-omp-service.c
-@@ -12,9 +12,10 @@
+@@ -4,6 +4,7 @@
+ #include <stdio.h>
+ #include <stdarg.h>
+ #include <stdlib.h>
++#include <unistd.h>
+ #include <pthread.h>
+ #include <sys/epoll.h>
+ 
+@@ -12,9 +13,10 @@
  #include <link.h>
  
  #include <doca_dev.h>
@@ -506,7 +597,7 @@ index 45e1d80..d6bea0b 100644
  
  #define SERVER_NAME "omp_test0"
  
-@@ -66,7 +67,7 @@ enum BF_COMMANDS {
+@@ -66,7 +68,7 @@ enum BF_COMMANDS {
  
  struct rep_devinfo {
  	char vuid[DOCA_DEVINFO_VUID_SIZE];
@@ -515,7 +606,7 @@ index 45e1d80..d6bea0b 100644
  
  	struct doca_dev_rep *rep_dev;
  };
-@@ -90,7 +91,7 @@ struct bf_info {
+@@ -90,7 +92,7 @@ struct bf_info {
  	unsigned char ipv4_addr[DOCA_DEVINFO_IPV4_ADDR_SIZE];
  	unsigned char ipv6_addr[DOCA_DEVINFO_IPV6_ADDR_SIZE];
  	
@@ -524,7 +615,7 @@ index 45e1d80..d6bea0b 100644
  	
  	struct mmap_support mmap_support;
  	struct comm_channel cc;
-@@ -104,15 +105,7 @@ struct bf_info {
+@@ -104,15 +106,7 @@ struct bf_info {
  
  
  struct bf_conn {
@@ -541,7 +632,7 @@ index 45e1d80..d6bea0b 100644
  
  	char sbuf[__MAX_SZ__];
  	char rbuf[__MAX_SZ__];
-@@ -153,7 +146,8 @@ int bf_send_buf(struct bf_conn *conn, void *buf, size_t sz)
+@@ -153,7 +147,8 @@ int bf_send_buf(struct bf_conn *conn, void *buf, size_t sz)
  			len = __MAX_SZ__;
  		else
  			len = sz - sent_len;
@@ -551,7 +642,7 @@ index 45e1d80..d6bea0b 100644
  		if (ack_reset > __ACK_RESET__) {
  			bf_recv_buf(conn, conn->rbuf, __MAX_SZ__);
  			//printf("ack after %ld bytes.\n", sent_len);
-@@ -174,12 +168,8 @@ int bf_recv_buf(struct bf_conn *conn, void *buf, size_t sz)
+@@ -174,12 +169,8 @@ int bf_recv_buf(struct bf_conn *conn, void *buf, size_t sz)
  			len = __MAX_SZ__;
  		else
  			len = sz - recvd_len;
@@ -566,7 +657,7 @@ index 45e1d80..d6bea0b 100644
  		if (ack_reset > __ACK_RESET__) {
  			bf_send_buf(conn, conn->sbuf, __MAX_SZ__);
  			//printf("ack after %ld bytes.\n", recvd_len);
-@@ -383,7 +373,7 @@ int process_cmd_run_target_region(struct bf_openmp_cmd *cmd)
+@@ -383,7 +374,7 @@ int process_cmd_run_target_region(struct bf_openmp_cmd *cmd)
  
  int process_cmd_set_info_flag(struct bf_openmp_cmd *cmd)
  {
@@ -575,7 +666,7 @@ index 45e1d80..d6bea0b 100644
  	return 0;
  }
  
-@@ -395,8 +385,7 @@ void bf_print_deviceinfo(int id)
+@@ -395,8 +386,7 @@ void bf_print_deviceinfo(int id)
  	printf("        iface     :  %s\n", devinfo.iface);
  	printf("        ib dev    :  %s\n", devinfo.ibdev);
  	printf("        doca id   :  %d\n", devinfo.doca_id);
@@ -585,7 +676,7 @@ index 45e1d80..d6bea0b 100644
  	printf("        ipv4 addr :  %s\n", devinfo.ipv4_addr);
  	printf("        ipv6 addr :  %s\n", devinfo.ipv6_addr);
  	printf("        rep list support           :   %s\n",
-@@ -435,7 +424,7 @@ int bf_init_deviceinfo()
+@@ -435,7 +425,7 @@ int bf_init_deviceinfo()
  	struct doca_devinfo_rep ** rep_dev_list;
  
  	total_devices = 0;
@@ -594,7 +685,7 @@ index 45e1d80..d6bea0b 100644
  	if (ret != DOCA_SUCCESS) {
  		DOCA_LOG_ERR("devinfo_list_create failed.");
  		return OFFLOAD_FAIL;
-@@ -445,13 +434,12 @@ int bf_init_deviceinfo()
+@@ -445,13 +435,12 @@ int bf_init_deviceinfo()
  	for (i = 0; i < tmp_total_devices; ++i) {
  		memset((void*)&devinfo, 0, sizeof(devinfo));
  
@@ -611,7 +702,7 @@ index 45e1d80..d6bea0b 100644
  			dev_list[i], &devinfo.rep_support);
  		if (ret != DOCA_SUCCESS) {
  			DOCA_LOG_ERR("devinfo get failed.");
-@@ -467,7 +455,7 @@ int bf_init_deviceinfo()
+@@ -467,7 +456,7 @@ int bf_init_deviceinfo()
  		++total_devices;
  
  	}
@@ -620,7 +711,7 @@ index 45e1d80..d6bea0b 100644
  	if (dev_list == NULL) {
  		DOCA_LOG_ERR("failed to allocated dev_list");
  		return OFFLOAD_FAIL;
-@@ -476,9 +464,8 @@ int bf_init_deviceinfo()
+@@ -476,9 +465,8 @@ int bf_init_deviceinfo()
  	for (i = 0, k = 0; i < tmp_total_devices; ++i) {
  		memset((void*)&devinfo, 0, sizeof(devinfo));
  
@@ -632,7 +723,7 @@ index 45e1d80..d6bea0b 100644
  			continue;
  		}
  
-@@ -496,8 +483,8 @@ int bf_init_deviceinfo()
+@@ -496,8 +484,8 @@ int bf_init_deviceinfo()
  			DOCA_LOG_ERR("devinfo get failed [ibdev].");
  			return OFFLOAD_FAIL;
  		}
@@ -643,7 +734,7 @@ index 45e1d80..d6bea0b 100644
  		if (ret != DOCA_SUCCESS) {
  			DOCA_LOG_ERR("devinfo get failed [PCI].");
  			return OFFLOAD_FAIL;
-@@ -528,14 +515,14 @@ int bf_init_deviceinfo()
+@@ -528,14 +516,14 @@ int bf_init_deviceinfo()
  			return OFFLOAD_FAIL;
  		}
  #endif
@@ -660,7 +751,7 @@ index 45e1d80..d6bea0b 100644
  			doca_dev_list[i], &devinfo.cc.max_msg_size);
  		if (ret != DOCA_SUCCESS) {
  			DOCA_LOG_ERR("devinfo get failed [cc max msg size].");
-@@ -543,20 +530,20 @@ int bf_init_deviceinfo()
+@@ -543,20 +531,20 @@ int bf_init_deviceinfo()
  		}
  #if 0
  		// fails regularly
@@ -684,7 +775,7 @@ index 45e1d80..d6bea0b 100644
  			doca_dev_list[i], &devinfo.cc.max_recv_queue_size);
  		if (ret != DOCA_SUCCESS) {
  			DOCA_LOG_ERR("devinfo get failed [cc max recv queue size].");
-@@ -568,8 +555,8 @@ int bf_init_deviceinfo()
+@@ -568,16 +556,17 @@ int bf_init_deviceinfo()
  			DOCA_LOG_ERR("dev open failed.");
  			return OFFLOAD_FAIL;
  		}
@@ -695,7 +786,8 @@ index 45e1d80..d6bea0b 100644
  		);
  		if (ret != DOCA_SUCCESS) {
  			DOCA_LOG_ERR("devinfo_rep_list_create failed.");
-@@ -577,7 +564,7 @@ int bf_init_deviceinfo()
++			doca_dev_close(dev);
+ 			return OFFLOAD_FAIL;
  		}
  		devinfo.rep = (struct rep_devinfo *)malloc(devinfo.total_rep_devices * sizeof(struct rep_devinfo));
  		for (j = 0; j < devinfo.total_rep_devices; ++j) {
@@ -704,7 +796,7 @@ index 45e1d80..d6bea0b 100644
  				doca_dev_list[i], &devinfo.rep_support);
  			if (ret != DOCA_SUCCESS) {
  				DOCA_LOG_ERR("devinfo failed [rep support]");
-@@ -598,7 +585,7 @@ int bf_init_deviceinfo()
+@@ -598,22 +587,29 @@ int bf_init_deviceinfo()
  			}
  #endif
  		}
@@ -713,16 +805,33 @@ index 45e1d80..d6bea0b 100644
  		doca_dev_close(dev);
  		dev_list[k].info = devinfo;
  		++k;
-@@ -613,7 +600,7 @@ void bf_deinit_deviceinfo()
- 		free(dev_list[j].info.rep);
  	}
- 	free(dev_list);
+ 
++	return OFFLOAD_SUCCESS;
+ }
+ 
+ void bf_deinit_deviceinfo()
+ {
+ 	int j;
+-	for (j = 0; j < total_devices; ++j) {
+-		free(dev_list[j].info.rep);
++	if (dev_list != NULL) {
++		for (j = 0; j < total_devices; ++j) {
++			free(dev_list[j].info.rep);
++		}
++		free(dev_list);
+ 	}
+-	free(dev_list);
 -	doca_devinfo_list_destroy(doca_dev_list);
-+	doca_devinfo_destroy_list(doca_dev_list);
++	dev_list = NULL;
++	total_devices = 0;
++	if (doca_dev_list != NULL)
++		doca_devinfo_destroy_list(doca_dev_list);
++	doca_dev_list = NULL;
  
  }
  
-@@ -626,65 +613,27 @@ int bf_init_connection(int id, char type, const char *server_name, struct bf_con
+@@ -626,65 +622,27 @@ int bf_init_connection(int id, char type, const char *server_name, struct bf_con
  	struct doca_dev      *doca_dev = devinfo.doca_dev;
  	struct doca_dev_rep   *rep_dev;
  
@@ -775,8 +884,8 @@ index 45e1d80..d6bea0b 100644
 -				== DOCA_ERROR_CONNECTION_INPROGRESS
 -		);
 -		DOCA_LOG_DBG("updated peer addr info");
--	}
--
+ 	}
+ 
 -
 -	conn->epoll_fd = epoll_create1(0);
 -
@@ -789,13 +898,13 @@ index 45e1d80..d6bea0b 100644
 -	if (ret == -1) {
 -		DOCA_LOG_ERR("epoll failed.");
 -		return OFFLOAD_FAIL;
- 	}
- 
+-	}
+-
 -
  	return 0;
  }
  
-@@ -700,7 +649,6 @@ int bf_init_device(int id, char type, const char *server_name)
+@@ -700,7 +658,6 @@ int bf_init_device(int id, char type, const char *server_name)
  
  	struct doca_dev_rep      **rep_dev;
  	struct doca_devinfo_rep ** rep_dev_list;
@@ -803,7 +912,7 @@ index 45e1d80..d6bea0b 100644
  
  	dev_list[id].total_libraries = 0;
  
-@@ -717,20 +665,12 @@ int bf_init_device(int id, char type, const char *server_name)
+@@ -717,20 +674,12 @@ int bf_init_device(int id, char type, const char *server_name)
  	if (type == SERVER_MODE) {
  		rep_dev = &devinfo->rep[0].rep_dev;
  
@@ -811,14 +920,15 @@ index 45e1d80..d6bea0b 100644
 -			*doca_dev, DOCA_DEV_REP_FILTER_NET, &rep_dev_list, &total_rep_devices
 -		);
 -		DOCA_LOG_INFO("total rep devices: %d\n", total_rep_devices);
--
--		doca_dev_rep_open(rep_dev_list[0], rep_dev);
 +		ret = odos_comch_open_rep(*doca_dev, rep_dev);
  
+-		doca_dev_rep_open(rep_dev_list[0], rep_dev);
+-
 -		if (*rep_dev == NULL) {
 +		if (ret != DOCA_SUCCESS || *rep_dev == NULL) {
  			DOCA_LOG_ERR("failed to open device.");
- 			return DOCA_ERROR_INITIALIZATION;
+-			return DOCA_ERROR_INITIALIZATION;
++			return OFFLOAD_FAIL;
  		}
 -		doca_devinfo_rep_get_pci_addr(rep_dev_list[0], &rep_pci_bdf);
 -		DOCA_LOG_DBG("opened rep device: %02X:%02X:%X\n", rep_pci_bdf.bus, rep_pci_bdf.device, rep_pci_bdf.function);
@@ -826,20 +936,51 @@ index 45e1d80..d6bea0b 100644
  	}
  
  	DOCA_LOG_DBG("opened device");
-@@ -748,7 +688,11 @@ int bf_init_device(int id, char type, const char *server_name)
+@@ -748,20 +697,35 @@ int bf_init_device(int id, char type, const char *server_name)
  
  void bf_deinit_device(int id)
  {
 -	doca_comm_channel_ep_destroy(dev_list[id].conn.ep);
+-	doca_dev_close(dev_list[id].info.doca_dev);
++	if (dev_list == NULL || id >= total_devices)
++		return;
 +	odos_comch_destroy(&dev_list[id].conn.cc);
 +	if (dev_list[id].info.rep != NULL && dev_list[id].info.rep[0].rep_dev != NULL) {
 +		doca_dev_rep_close(dev_list[id].info.rep[0].rep_dev);
 +		dev_list[id].info.rep[0].rep_dev = NULL;
 +	}
- 	doca_dev_close(dev_list[id].info.doca_dev);
++	if (dev_list[id].info.doca_dev != NULL) {
++		doca_dev_close(dev_list[id].info.doca_dev);
++		dev_list[id].info.doca_dev = NULL;
++	}
  }
  
-@@ -769,7 +713,7 @@ void deinit_server()
+ 
++static const char *init_error;
++
+ int init_server()
+ {
+-
+-	int ret;
+-	ret = bf_init_deviceinfo();
+-	ret = bf_init_device(0, SERVER_MODE, SERVER_NAME);
+-	if (ret == OFFLOAD_FAIL)
++	init_error = NULL;
++	if (bf_init_deviceinfo() != OFFLOAD_SUCCESS || total_devices == 0) {
++		init_error = "no DOCA device usable as a Comch server with network"
++		             " representors (on the DPU this needs root)";
+ 		return ~DOCA_SUCCESS;
+-
++	}
++	if (bf_init_device(0, SERVER_MODE, SERVER_NAME) != OFFLOAD_SUCCESS) {
++		init_error = "could not open the representor or start the Comch"
++		             " server (see ODOS_COMCH_REP_PCI)";
++		return ~DOCA_SUCCESS;
++	}
+ 	return DOCA_SUCCESS;
+ }
+ 
+@@ -769,7 +733,7 @@ void deinit_server()
  {
  	bf_deinit_device(0);
  	bf_deinit_deviceinfo();
@@ -848,7 +989,7 @@ index 45e1d80..d6bea0b 100644
  	return;
  }
  
-@@ -781,7 +725,10 @@ int run_service()
+@@ -781,7 +745,10 @@ int run_service()
  	size_t msglen = sizeof(cmd);
  
  	while (1) {
@@ -860,12 +1001,28 @@ index 45e1d80..d6bea0b 100644
  		DOCA_LOG_DBG("cmd: %d\n", cmd.cmd);
  		switch(cmd.cmd) {
  			case CMD_LOAD_BINARY:
-@@ -822,7 +769,7 @@ deinit:
+@@ -822,14 +789,23 @@ deinit:
  int main(int argc, char *argv[])
  {
  	int ret;
 -	doca_log_global_level_set(DOCA_LOG_LEVEL_CRIT);
++	int reported = 0;
 +	odos_doca_log_level_set(DOCA_LOG_LEVEL_CRIT);
  
  	while (1) {
  		ret = init_server();
+ 		if (ret == DOCA_SUCCESS) {
++			reported = 0;
+ 			run_service();
++		} else if (!reported) {
++			/* logging is limited to CRIT, so say why on stderr, once */
++			fprintf(stderr, "doca-omp-service: initialisation failed: %s;"
++			        " retrying every second\n", init_error);
++			reported = 1;
+ 		}
+ 		deinit_server();
++		if (ret != DOCA_SUCCESS)
++			sleep(1);
+ 	}
+ 	return 0;
+ }
