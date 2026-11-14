@@ -39,17 +39,38 @@ export OPAL_PREFIX=$MPI
 LD_LIBRARY_PATH=$MPI/lib:$ODOS_PREFIX/ucx/lib:$DOCA_PATH/lib/`uname -m`-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 export LD_LIBRARY_PATH
 
+# The service reports with printf. In a pod stdout is a pipe, so it is block
+# buffered and "[server] listening" never reaches `crictl logs`; line-buffer it.
+LINEBUF=
+if command -v stdbuf >/dev/null 2>&1; then LINEBUF="stdbuf -oL -eL"; fi
+
+# Run the service as a child and forward SIGTERM/SIGINT to it. In a container
+# this script is PID 1, and the kernel drops signals to PID 1 that have no
+# handler: an exec'd service would ignore the kubelet's SIGTERM and be
+# SIGKILLed after the grace period, skipping its Comch teardown.
+run() {
+	"$@" &
+	child=$!
+	trap 'kill -TERM "$child" 2>/dev/null' TERM INT
+	status=0
+	while kill -0 "$child" 2>/dev/null; do
+		wait "$child"
+		status=$?
+	done
+	exit $status
+}
+
 case $ODOS_SERVICE in
 ref)
-	exec "$ODOS_PREFIX/service/doca-omp-service" "$@"
+	run $LINEBUF "$ODOS_PREFIX/service/doca-omp-service" "$@"
 	;;
 mpi)
 	if [ -n "$ODOS_MPIRUN_ARGS" ]; then
 		# word splitting of ODOS_MPIRUN_ARGS is intended
-		exec "$MPI/bin/mpirun" -x OPAL_PREFIX -x LD_LIBRARY_PATH $ODOS_MPIRUN_ARGS \
-			"$ODOS_PREFIX/service/doca-omp-service-mpi" "$@"
+		run "$MPI/bin/mpirun" -x OPAL_PREFIX -x LD_LIBRARY_PATH $ODOS_MPIRUN_ARGS \
+			$LINEBUF "$ODOS_PREFIX/service/doca-omp-service-mpi" "$@"
 	fi
-	exec "$ODOS_PREFIX/service/doca-omp-service-mpi" "$@"
+	run $LINEBUF "$ODOS_PREFIX/service/doca-omp-service-mpi" "$@"
 	;;
 *)
 	echo "odos-dpu-service: unknown ODOS_SERVICE '$ODOS_SERVICE' (ref or mpi)" >&2

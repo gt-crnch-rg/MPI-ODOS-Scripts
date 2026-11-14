@@ -212,8 +212,16 @@ Then as root:
   returned to listening after each disconnect. The service under test was an
   ASan/UBSan build, which reported no errors.
 
-**Not yet tested:** deployment through `/etc/kubelet.d`, and a real ODOS
-OpenMP offload or MPI application.
+- The image was deployed as a kubelet static pod, imported with
+  `ctr -n k8s.io images import` and started from
+  [odos-dpu-service.yaml](odos-dpu-service.yaml). The round-trip test against
+  the pod passed at about 1 GB/s for 16 MB buffers. `crictl logs` shows
+  `[server] listening as omp_test0` at start and after each reconnect.
+  Removing the manifest stops the pod in under a second: the launcher passes
+  the kubelet's SIGTERM on to the service.
+
+**Not yet tested:** a real ODOS OpenMP offload or MPI application across host
+and DPU.
 
 ## Round-trip test
 
